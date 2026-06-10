@@ -1,9 +1,8 @@
 [project]
-name = "horus-runtime-plugin"
-description = "A custom plugin for the Horus runtime, providing additional functionality and integrations."
+name = "horus-slurm"
 version = "0.0.1"
+description = "Run Horus tasks on Slurm clusters"
 requires-python = ">=3.13"
-license = { file = "LICENSE" }
 classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
@@ -13,8 +12,8 @@ dependencies = ["horus-runtime>=0.1.1"]
 # ================
 # Plugin entry-points
 # ================
-[project.entry-points."horus.task"]
-custom_task = "my_plugin.task.custom_task"
+[project.entry-points."horus.target"]
+slurm_target = "horus_slurm.target.slurm"
 
 # ================
 
@@ -36,19 +35,19 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.coverage.run]
-source = ["my_plugin"]
+source = ["horus_slurm"]
 
 [tool.coverage.report]
 omit = ["tests/*"]
 
 [tool.hatch.build]
 artifacts = [
-  "src/my_plugin/py.typed",
-  "src/my_plugin/locale/**/LC_MESSAGES/*.mo",
+  "src/horus_slurm/py.typed",
+  "src/horus_slurm/locale/**/LC_MESSAGES/*.mo",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/my_plugin"]
+packages = ["src/horus_slurm"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -64,7 +63,7 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 addopts = """
     --verbose
-    --cov=src/my_plugin
+    --cov=src/horus_slurm
     --cov-report=html
     --cov-report=term-missing
     --cov-fail-under=90
