@@ -7,7 +7,9 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
 ]
-dependencies = ["horus-runtime>=0.1.1"]
+dependencies = [
+  "horus-runtime>=0.1.1",
+]
 
 # ================
 # Plugin entry-points
