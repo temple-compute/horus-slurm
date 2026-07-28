@@ -19,6 +19,7 @@ Slurm target for horus-runtime.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 import signal
 from pathlib import Path
@@ -84,6 +85,8 @@ class SlurmTarget(BaseTarget):
     # from BaseTarget is fine, but you may want to raise this to reduce
     # squeue/sacct load on shared login nodes with many concurrent jobs.
     poll_interval: ClassVar[float] = 5.0
+    exit_code_retries: int = 5
+    exit_code_delay: float = 5.0
 
     # --- placement identity -------------------------------------------------
 
@@ -212,22 +215,59 @@ class SlurmTarget(BaseTarget):
         Poll job status.
         """
         exit_code_path = f"{handle.job_dir}/exit_code"
+
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
             return int(raw.decode().strip())
 
         if await self._vanished_from_queue(handle):
-            # Left the queue without ever writing exit_code: killed by the
-            # scheduler (OOM, node failure, wall-time), or cancelled outside
-            # Horus. Fail rather than poll forever.
+            # Left the queue without exit_code visible yet. This can be a race:
+            # Slurm sometimes flushes exit_code a few seconds after the job
+            # disappears from squeue. Retry briefly before concluding it was
+            # killed by the scheduler (OOM, node failure, wall-time) or
+            # cancelled outside Horus.
+            exit_code = await self._retry_exit_code(exit_code_path)
+            if exit_code is not None:
+                return exit_code
+
+            horus_logger.log.error(
+                _("The job vanished from queue without writting an exit code.")
+            )
             return 1
 
+        return None
+
+    async def _retry_exit_code(
+        self,
+        exit_code_path: str,
+    ) -> int | None:
+        """
+        Retry fetching exit_code after the job vanished from the queue,
+        to cover the case where Slurm writes it with a slight delay.
+        """
+        # TODO: Be able to re-attach if workflow failed but job ended.
+        for _attempt in range(self.exit_code_retries):
+            horus_logger.log.debug(
+                _(
+                    "Retrying exit_code fetch, "
+                    "attempt %(attempt)d/%(attempts)d..."
+                )
+                % {
+                    "attempt": _attempt + 1,
+                    "attempts": self.exit_code_retries,
+                },
+            )
+            await asyncio.sleep(self.exit_code_delay)
+            if await self.inner.path_exists(exit_code_path):
+                raw = await self.inner.get_file(exit_code_path)
+                return int(raw.decode().strip())
         return None
 
     async def read_output(self, handle: JobHandle) -> tuple[bytes, bytes]:
         """
         Read job stderr and stdout.
         """
+        stdout, stderr = b"", b""
         try:
             stdout = await self._read_log(f"{handle.job_dir}/stdout.log")
         except Exception:
