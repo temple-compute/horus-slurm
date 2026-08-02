@@ -1,6 +1,6 @@
 [project]
 name = "horus-slurm"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Run Horus tasks on Slurm clusters"
 requires-python = ">=3.13"
 classifiers = [
@@ -39,10 +39,11 @@ dev = [
   "pytest-cov~=7.0",
   "ruff~=0.15",
   "types-PyYAML~=6.0",
+  "uv-dynamic-versioning>=0.14.0",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.29,<2.0", "uv-dynamic-versioning>=0.14.0,<1.0"]
 build-backend = "hatchling.build"
 
 [tool.coverage.run]
@@ -56,6 +57,9 @@ artifacts = [
   "src/horus_slurm/py.typed",
   "src/horus_slurm/locale/**/LC_MESSAGES/*.mo",
 ]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/horus_slurm"]
@@ -127,6 +131,9 @@ convention = "google"
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.1"
 
 [tool.uv.sources]
 horus-resource-monitor = { git = "https://github.com/temple-compute/horus-resource-monitor" }
