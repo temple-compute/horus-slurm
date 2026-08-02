@@ -9,8 +9,14 @@ classifiers = [
 ]
 dependencies = [
   "horus-runtime>=0.1.1",
-  "horus-resource-monitor",
 ]
+
+# The slurm_job probe (horus_slurm.probe) needs horus-resource-monitor's
+# probe classes to import. Without this extra, that entry point just fails
+# to load and is skipped (see AutoRegistry.init_registry) - the Slurm target
+# still works, it just isn't probed for resource usage.
+[project.optional-dependencies]
+resource-monitor = ["horus-resource-monitor"]
 
 # ================
 # Plugin entry-points
@@ -33,6 +39,7 @@ horus-resource-monitor = { git = "https://github.com/temple-compute/horus-resour
 
 [dependency-groups]
 dev = [
+  "horus-slurm[resource-monitor]",
   "babel~=2.0",
   "licenseheaders~=0.8",
   "mypy~=1.19",

@@ -153,13 +153,18 @@ name = "horus-slurm"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
-    { name = "horus-resource-monitor" },
     { name = "horus-runtime" },
+]
+
+[package.optional-dependencies]
+resource-monitor = [
+    { name = "horus-resource-monitor" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "babel" },
+    { name = "horus-slurm", extra = ["resource-monitor"] },
     { name = "licenseheaders" },
     { name = "mypy" },
     { name = "pre-commit" },
@@ -172,13 +177,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "horus-resource-monitor", git = "https://github.com/temple-compute/horus-resource-monitor?rev=95f9dfe5d50a1b005564993d71c1e20f29554079" },
+    { name = "horus-resource-monitor", marker = "extra == 'resource-monitor'", git = "https://github.com/temple-compute/horus-resource-monitor?rev=95f9dfe5d50a1b005564993d71c1e20f29554079" },
     { name = "horus-runtime", git = "https://github.com/temple-compute/horus-runtime?rev=76fa77bd8daeecead8a9bdd3d4fdaf5b21a0b0f0" },
 ]
+provides-extras = ["resource-monitor"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "babel", specifier = "~=2.0" },
+    { name = "horus-slurm", extras = ["resource-monitor"] },
     { name = "licenseheaders", specifier = "~=0.8" },
     { name = "mypy", specifier = "~=1.19" },
     { name = "pre-commit", specifier = "~=4.0" },
