@@ -37,9 +37,22 @@ from horus_runtime.logging import horus_logger
 from pydantic import Field
 
 from horus_slurm.i18n import tr as _
+from horus_slurm.resources import SlurmJobScope
 
 if TYPE_CHECKING:
     from horus_runtime.core.artifact.base import BaseArtifact
+    from horus_runtime.core.resources import ResourceScope
+    from horus_runtime.core.task.base import BaseTask
+
+JOB_ID_FILE = ".horus_slurm_job_id"
+"""
+Name of the file, under the task's working directory, that the target writes
+the submitted job's id to.
+
+The scope is declared before ``sbatch`` runs, so an observer cannot be handed
+the id directly; it is told where the id will appear instead, and reads it
+once the job exists. Same contract as docker's ``--cidfile``.
+"""
 
 
 class SlurmTarget(BaseTarget):
@@ -205,10 +218,59 @@ class SlurmTarget(BaseTarget):
         # the note at the bottom of this file.
         raw_id = out.decode().strip()
         job_id = raw_id.split(";", 1)[0]
+        await self._publish_job_id(job_id, cwd=cwd)
 
+        # pid stays None on purpose: a Slurm job id is not a process id, and
+        # anything downstream that reads `pid` (resource observation, above
+        # all) would be interpreting it on the wrong host entirely.
         return JobHandle(
-            pid=int(job_id), job_dir=job_dir, extra={"raw_job_id": raw_id}
+            pid=None,
+            job_dir=job_dir,
+            extra={"job_id": job_id, "raw_job_id": raw_id},
         )
+
+    @staticmethod
+    def _job_id_path(task: BaseTask) -> str:
+        """Path on the target where the submitted job's id is written."""
+        return (Path(task.working_dir) / JOB_ID_FILE).as_posix()
+
+    async def _publish_job_id(self, job_id: str, *, cwd: str | None) -> None:
+        """
+        Record the job id where an observer can find it.
+
+        Best effort: measurement must never be the reason a job fails, so a
+        write that does not land only costs the Slurm-side numbers.
+        """
+        base = (
+            self._job_id_path(self._task)
+            if self._task is not None
+            else f"{(cwd or self.resolved_working_directory)}/{JOB_ID_FILE}"
+        )
+        try:
+            await self.inner.put_file(job_id.encode(), base)
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not record job id for observation: %(err)s")
+                % {"err": exc}
+            )
+
+    async def resource_scope(
+        self, task: BaseTask, process: ChannelProcess | None = None
+    ) -> ResourceScope | None:
+        """
+        Report the Slurm job, not whatever the orchestrator spawned.
+
+        ``sbatch`` returns immediately, so the submitting process is gone (or
+        meaningless) long before the work runs on a compute node. *process* is
+        ignored for exactly that reason.
+        """
+        del process
+        return SlurmJobScope(job_id_file=self._job_id_path(task))
+
+    @staticmethod
+    def _handle_job_id(handle: JobHandle) -> str:
+        """The Slurm job id carried by *handle*."""
+        return (handle.extra or {}).get("job_id", "")
 
     async def poll(self, handle: JobHandle) -> int | None:
         """
@@ -285,7 +347,7 @@ class SlurmTarget(BaseTarget):
         except ValueError:
             name = "TERM"
         proc = await self.inner.run_command_sync(
-            f"scancel --signal={name} {handle.pid}"
+            f"scancel --signal={name} {self._handle_job_id(handle)}"
         )
         await proc.wait()
 
@@ -340,7 +402,7 @@ class SlurmTarget(BaseTarget):
 
     async def _vanished_from_queue(self, handle: JobHandle) -> bool:
         proc = await self.inner.run_command_sync(
-            f"squeue -h -j {handle.pid} -o %T"
+            f"squeue -h -j {self._handle_job_id(handle)} -o %T"
         )
         out, _err = await proc.communicate()
         # Only trust an empty *successful* result -- a nonzero exit from

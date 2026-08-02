@@ -9,6 +9,7 @@ classifiers = [
 ]
 dependencies = [
   "horus-runtime>=0.1.1",
+  "horus-resource-monitor",
 ]
 
 # ================
@@ -17,7 +18,18 @@ dependencies = [
 [project.entry-points."horus.target"]
 slurm_target = "horus_slurm.target.slurm"
 
+[project.entry-points."horus.resource_probe"]
+slurm_job = "horus_slurm.probe"
+
 # ================
+
+# TEMPORARY: pins the unmerged branches that introduce the target-declared
+# ResourceScope (horus-runtime) and the probe framework this builds on
+# (horus-resource-monitor). Repoint at released versions, and bump the
+# dependency specifiers above, before these branches are merged.
+[tool.uv.sources]
+horus-runtime = { git = "https://github.com/temple-compute/horus-runtime", rev = "76fa77bd8daeecead8a9bdd3d4fdaf5b21a0b0f0" }
+horus-resource-monitor = { git = "https://github.com/temple-compute/horus-resource-monitor", rev = "95f9dfe5d50a1b005564993d71c1e20f29554079" }
 
 [dependency-groups]
 dev = [
@@ -111,7 +123,9 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["SLF001"]
+# Tests reach into privates on purpose, and their fixtures and expected
+# values are literals by nature.
+"tests/**/*.py" = ["SLF001", "PLR2004", "D107"]
 
 [tool.ruff.format]
 quote-style = "double"
