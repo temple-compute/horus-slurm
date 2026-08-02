@@ -5,18 +5,11 @@
 # MIT License
 #
 """
-Resource probe for work that Slurm owns.
+Resource probe for Slurm jobs.
 
-Two sources, because neither alone is enough:
-
-- The time series comes from the sampler the resource monitor injects into
-  the command. Slurm puts that command in the batch script, so the sampler
-  runs *on the compute node*, watching the real process tree, and costs the
-  scheduler nothing. Inherited wholesale from :class:`ShellSamplerProbe`.
-- The totals come from ``sacct`` at the end. Slurm's own accounting is the
-  only thing that still reports for a job it killed itself — an OOM or a
-  wall-time kill takes the sampler down with the job, so the last thing the
-  series shows is a job that was doing fine.
+The series comes from the sampler the resource monitor injects into the
+command, which Slurm runs on the compute node. ``sacct`` supplies the totals
+at the end, being the only source that still reports for a job Slurm killed.
 """
 
 import asyncio
@@ -40,8 +33,7 @@ SACCT_COMMAND = (
     f"sacct -n -P -o {SACCT_FORMAT} -j"  # -P: parsable, no aligned padding
 )
 
-#: Slurm flushes accounting a moment after a job leaves the queue, the same
-#: race ``SlurmTarget.poll`` already works around for the exit code.
+#: Slurm flushes accounting a moment after a job leaves the queue.
 SACCT_RETRIES = 3
 SACCT_DELAY = 2.0
 
@@ -70,9 +62,6 @@ _MIN_FIELDS = 2
 def parse_size_kb(text: str) -> float | None:
     """
     Parse a sacct size (``1234K``, ``1.5G``, bare ``1234``) into kilobytes.
-
-    Returns ``None`` for anything unrecognisable, which includes the empty
-    field sacct gives for a job step that never reported one.
     """
     match = _SIZE.match(text.strip())
     if match is None:
@@ -105,11 +94,10 @@ def parse_cpu_seconds(text: str) -> float | None:
 
 def parse_sacct(text: str) -> dict[str, float] | None:
     """
-    Pull the peak RSS and total CPU out of ``sacct`` output.
+    Peak RSS and total CPU from ``sacct`` output.
 
-    A job reports several rows (the job, its ``.batch`` step, ``.extern``,
-    any ``srun`` steps) and the interesting numbers live on the steps rather
-    than the job row, so take the largest of each across every row.
+    A job reports several rows and the numbers live on the steps, not the
+    job row, so take the largest of each.
     """
     rss: float | None = None
     cpu: float | None = None
@@ -143,12 +131,8 @@ class SlurmJobProbe(ShellSamplerProbe):
     @classmethod
     def supports(cls, scope: ResourceScope, target: BaseTarget) -> bool:
         """
-        Slurm jobs, wherever the login node happens to be.
-
-        Deliberately not conditioned on the target being reachable locally:
-        the work is on a compute node either way, so there is nothing the
-        orchestrator could look at directly even when it shares a host with
-        the scheduler.
+        Slurm jobs. Never conditioned on the target being local: the work is
+        on a compute node either way.
         """
         del target
         return isinstance(scope, SlurmJobScope)
@@ -171,8 +155,6 @@ class SlurmJobProbe(ShellSamplerProbe):
     async def _resolve_id(self) -> str | None:
         """
         The job id, read from the file the target writes once it submits.
-
-        A miss is normal before submission and is retried on the next call.
         """
         if self._job_id or self._job_id_file is None or self._task is None:
             return self._job_id
@@ -212,8 +194,8 @@ class SlurmJobProbe(ShellSamplerProbe):
         """
         Run ``sacct`` for *job_id*, retrying while accounting catches up.
 
-        Goes through ``run_command_sync``: this target submits by default, so
-        ``run_command`` would queue a whole Slurm job to read a number.
+        Via ``run_command_sync``: this target submits by default, so
+        ``run_command`` would queue a job just to read a number.
         """
         target = self._task.target if self._task else None
         if target is None:

@@ -46,12 +46,7 @@ if TYPE_CHECKING:
 
 JOB_ID_FILE = ".horus_slurm_job_id"
 """
-Name of the file, under the task's working directory, that the target writes
-the submitted job's id to.
-
-The scope is declared before ``sbatch`` runs, so an observer cannot be handed
-the id directly; it is told where the id will appear instead, and reads it
-once the job exists. Same contract as docker's ``--cidfile``.
+File under the task working directory holding the submitted job's id.
 """
 
 
@@ -220,9 +215,7 @@ class SlurmTarget(BaseTarget):
         job_id = raw_id.split(";", 1)[0]
         await self._publish_job_id(job_id, cwd=cwd)
 
-        # pid stays None on purpose: a Slurm job id is not a process id, and
-        # anything downstream that reads `pid` (resource observation, above
-        # all) would be interpreting it on the wrong host entirely.
+        # pid stays None: a job id is not a process id.
         return JobHandle(
             pid=None,
             job_dir=job_dir,
@@ -236,10 +229,7 @@ class SlurmTarget(BaseTarget):
 
     async def _publish_job_id(self, job_id: str, *, cwd: str | None) -> None:
         """
-        Record the job id where an observer can find it.
-
-        Best effort: measurement must never be the reason a job fails, so a
-        write that does not land only costs the Slurm-side numbers.
+        Record the job id where an observer can find it. Best effort.
         """
         base = (
             self._job_id_path(self._task)
@@ -259,10 +249,6 @@ class SlurmTarget(BaseTarget):
     ) -> ResourceScope | None:
         """
         Report the Slurm job, not whatever the orchestrator spawned.
-
-        ``sbatch`` returns immediately, so the submitting process is gone (or
-        meaningless) long before the work runs on a compute node. *process* is
-        ignored for exactly that reason.
         """
         del process
         return SlurmJobScope(job_id_file=self._job_id_path(task))
