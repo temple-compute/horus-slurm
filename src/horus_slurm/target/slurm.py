@@ -370,7 +370,11 @@ class SlurmTarget(BaseTarget):
         except Exception:
             horus_logger.log.info(_("Could not read stdout: {s}"))
 
-        stderr = await self._read_log(f"{handle.job_dir}/stderr.log")
+        try:
+            stderr = await self._read_log(f"{handle.job_dir}/stderr.log")
+        except Exception:
+            horus_logger.log.info(_("Could not read stderr: {s}"))
+
         return stdout, stderr
 
     async def send_signal(self, handle: JobHandle, sig: int) -> None:
