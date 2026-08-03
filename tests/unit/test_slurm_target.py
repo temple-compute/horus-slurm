@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from horus_runtime.context import HorusContext
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.event.base import BaseEvent
 
+from horus_slurm.events import SlurmJobEvent
 from horus_slurm.resources import SlurmJobScope
 from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
 
@@ -34,6 +37,27 @@ class _Task:
 
     def __init__(self, working_dir: str) -> None:
         self.working_dir = working_dir
+
+
+@pytest.fixture
+def emitted(
+    horus_context: HorusContext, monkeypatch: pytest.MonkeyPatch
+) -> list[SlurmJobEvent]:
+    """
+    Collect the job events published on the bus during a test.
+
+    Intercepting ``emit`` rather than subscribing keeps the assertion about
+    what the *target* published, independent of transport or handler
+    behaviour.
+    """
+    events: list[SlurmJobEvent] = []
+
+    def capture(event: BaseEvent) -> None:
+        if isinstance(event, SlurmJobEvent):
+            events.append(event)
+
+    monkeypatch.setattr(horus_context.bus, "emit", capture)
+    return events
 
 
 @pytest.mark.unit
@@ -229,6 +253,115 @@ class TestPolling:
         """
         inner = FakeInner(working_directory=str(tmp_path)).responds(
             squeue=FakeProcess(stdout=b"", returncode=1)
+        )
+        handle = JobHandle(pid=None, job_dir=str(tmp_path))
+
+        assert await _target(inner).poll(handle) is None
+
+
+@pytest.mark.unit
+class TestQueueState:
+    """What ``squeue`` is understood to be saying."""
+
+    @pytest.mark.parametrize(
+        ("stdout", "returncode", "expected"),
+        [
+            (b"PENDING\n", 0, "PENDING"),
+            (b"", 0, ""),
+            # A blip must be "don't know", never "gone": the caller treats
+            # gone as a failure.
+            (b"", 1, None),
+            # Array elements report one line each; the first is enough.
+            (b"RUNNING\nRUNNING\n", 0, "RUNNING"),
+        ],
+    )
+    async def test_squeue_output_is_read_correctly(
+        self,
+        tmp_path: Path,
+        stdout: bytes,
+        returncode: int,
+        expected: str | None,
+    ) -> None:
+        """Present, gone, and unknown are three different answers."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=stdout, returncode=returncode)
+        )
+        handle = JobHandle(pid=None, job_dir=str(tmp_path))
+
+        assert await _target(inner)._queue_state(handle) == expected
+
+
+@pytest.mark.unit
+class TestJobEvents:
+    """The job id and its queue state reach the bus."""
+
+    async def test_submission_announces_the_job_id(
+        self, inner: FakeInner, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """
+        The id is otherwise only on the cluster filesystem, so this event is
+        the only way an observer learns which job to look at.
+        """
+        await _target(inner).launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        assert [(e.job_id, e.state) for e in emitted] == [
+            ("12345", "SUBMITTED")
+        ]
+
+    async def test_only_transitions_are_announced(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """
+        Polling happens every few seconds for the life of a job; a consumer
+        that persists events must not get one row per poll.
+        """
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b"PENDING\n")
+        )
+        target = _target(inner)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        await target.poll(handle)
+        await target.poll(handle)
+        inner.responds(squeue=FakeProcess(stdout=b"RUNNING\n"))
+        await target.poll(handle)
+        await target.poll(handle)
+
+        assert [e.state for e in emitted] == ["PENDING", "RUNNING"]
+
+    async def test_vanishing_without_an_exit_code_is_announced(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """A job killed by the scheduler leaves no other trace."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b"")
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) == 1
+        assert [e.state for e in emitted] == ["GONE"]
+
+    async def test_announcing_never_breaks_a_poll(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Outside a Horus context there is no bus at all (the plain CLI), and a
+        job must not care.
+        """
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b"PENDING\n")
+        )
+        monkeypatch.setattr(
+            HorusContext,
+            "get_context",
+            staticmethod(lambda: (_ for _ in ()).throw(LookupError())),
         )
         handle = JobHandle(pid=None, job_dir=str(tmp_path))
 

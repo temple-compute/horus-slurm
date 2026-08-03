@@ -20,6 +20,9 @@ slurm_job = "horus_slurm.probe"
 [project.entry-points."horus.target"]
 slurm_target = "horus_slurm.target.slurm"
 
+[project.entry-points."horus.event"]
+slurm_job = "horus_slurm.events"
+
 # The slurm_job probe (horus_slurm.probe) needs horus-resource-monitor's
 # probe classes to import. Without this extra, that entry point just fails
 # to load and is skipped (see AutoRegistry.init_registry) - the Slurm target

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.target.local import LocalTarget
+from horus_runtime.context import HorusContext
 from horus_runtime.core.target.base import BaseTarget
 from horus_runtime.core.target.channel import (
     ChannelProcess,
@@ -36,6 +37,7 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
 from pydantic import Field
 
+from horus_slurm.events import GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
 from horus_slurm.resources import SlurmJobScope
 
@@ -95,6 +97,12 @@ class SlurmTarget(BaseTarget):
     poll_interval: ClassVar[float] = 5.0
     exit_code_retries: int = 5
     exit_code_delay: float = 5.0
+
+    _last_state: str | None = None
+    """
+    Last queue state announced on the bus, so ``poll`` emits on transitions
+    rather than once per poll.
+    """
 
     # --- placement identity -------------------------------------------------
 
@@ -214,6 +222,7 @@ class SlurmTarget(BaseTarget):
         raw_id = out.decode().strip()
         job_id = raw_id.split(";", 1)[0]
         await self._publish_job_id(job_id, cwd=cwd)
+        self._announce(job_id, SUBMITTED)
 
         # pid stays None: a job id is not a process id.
         return JobHandle(
@@ -244,6 +253,32 @@ class SlurmTarget(BaseTarget):
                 % {"err": exc}
             )
 
+    def _announce(self, job_id: str, state: str) -> None:
+        """
+        Publish a job state on the event bus, if it changed. Best effort.
+
+        Nothing here may fail a job: there is no bus at all outside a Horus
+        context (the plain CLI), and a subscriber that raises is the
+        subscriber's problem, not this job's.
+        """
+        if state == self._last_state:
+            return
+        self._last_state = state
+        try:
+            HorusContext.get_context().bus.emit(
+                SlurmJobEvent(
+                    task_id=self._task.id if self._task is not None else "",
+                    job_id=job_id,
+                    state=state,
+                    message=_("Slurm job %(job_id)s is %(state)s")
+                    % {"job_id": job_id, "state": state},
+                )
+            )
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not announce Slurm job state: %(err)s") % {"err": exc}
+            )
+
     async def resource_scope(
         self, task: BaseTask, process: ChannelProcess | None = None
     ) -> ResourceScope | None:
@@ -263,12 +298,19 @@ class SlurmTarget(BaseTarget):
         Poll job status.
         """
         exit_code_path = f"{handle.job_dir}/exit_code"
+        job_id = self._handle_job_id(handle)
+
+        # Announce before the exit_code short-circuit: a job that finishes
+        # between two polls would otherwise never report having run.
+        state = await self._queue_state(handle)
+        if state:
+            self._announce(job_id, state)
 
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
             return int(raw.decode().strip())
 
-        if await self._vanished_from_queue(handle):
+        if state == "":
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
             # disappears from squeue. Retry briefly before concluding it was
@@ -278,6 +320,7 @@ class SlurmTarget(BaseTarget):
             if exit_code is not None:
                 return exit_code
 
+            self._announce(job_id, GONE)
             horus_logger.log.error(
                 _("The job vanished from queue without writting an exit code.")
             )
@@ -314,6 +357,12 @@ class SlurmTarget(BaseTarget):
     async def read_output(self, handle: JobHandle) -> tuple[bytes, bytes]:
         """
         Read job stderr and stdout.
+
+        ponytail: re-reads both logs whole on every call, and
+        ``PollingChannelProcess.stream`` calls this once per poll interval, so
+        tailing a long-running chatty job is O(n^2) in log size. Switch to a
+        ranged read (``tail -c +offset``) if job logs get large enough to
+        matter.
         """
         stdout, stderr = b"", b""
         try:
@@ -386,15 +435,28 @@ class SlurmTarget(BaseTarget):
         except FileNotFoundError:
             return b""
 
-    async def _vanished_from_queue(self, handle: JobHandle) -> bool:
+    async def _queue_state(self, handle: JobHandle) -> str | None:
+        """
+        What ``squeue`` says about the job right now.
+
+        Returns the state string (``PENDING``, ``RUNNING``, …), ``""`` when the
+        job is no longer in the queue, or ``None`` when squeue could not
+        answer. Only an empty *successful* result means gone -- a nonzero exit
+        (e.g. a slurmctld hiccup) must NOT be read that way, or a transient
+        scheduler blip will fail jobs that are still fine.
+        """
         proc = await self.inner.run_command_sync(
             f"squeue -h -j {self._handle_job_id(handle)} -o %T"
         )
         out, _err = await proc.communicate()
-        # Only trust an empty *successful* result -- a nonzero exit from
-        # squeue (e.g. slurmctld hiccup) should NOT be read as "job gone",
-        # or a transient scheduler blip will fail jobs that are still fine.
-        return proc.returncode == 0 and not out.strip()
+        if proc.returncode != 0:
+            return None
+        text = out.decode(errors="replace").strip()
+        if not text:
+            return ""
+        # A job array reports one line per element; the first is enough for a
+        # single job, which is all this target submits.
+        return text.splitlines()[0].strip()
 
 
 # --- Known limitations / next steps -----------------------------------------
