@@ -15,12 +15,13 @@ from typing import Any
 
 import pytest
 from horus_runtime.context import HorusContext
+from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.event.base import BaseEvent
 
 from horus_slurm.events import SlurmJobEvent
-from horus_slurm.resources import SlurmJobScope
+from horus_slurm.resources import SlurmJobScope, resolve_resources
 from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
 
 from .conftest import FakeInner, FakeProcess
@@ -33,10 +34,21 @@ def _target(inner: FakeInner, **kwargs: Any) -> SlurmTarget:
 
 
 class _Task:
-    """The only thing the scope needs from a task."""
+    """The only things the target needs from a task."""
 
-    def __init__(self, working_dir: str) -> None:
+    def __init__(
+        self, working_dir: str, resources: ResourceRequest | None = None
+    ) -> None:
         self.working_dir = working_dir
+        self.resources = resources
+
+
+def _bind(target: SlurmTarget, task: _Task) -> None:
+    """
+    Bind the stand-in task. Keeps the one type: ignore the duck type needs
+    in a single place rather than at every call site.
+    """
+    target.bind(task)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -150,6 +162,146 @@ class TestSubmission:
         # The command runs *inside* the script, which is what puts the
         # resource monitor's injected sampler on the compute node.
         assert "( run me );" in script
+
+
+@pytest.mark.unit
+class TestResolveResources:
+    """The portable request -> sbatch translation, on its own."""
+
+    def test_nothing_declared_falls_back_to_one_cpu(self) -> None:
+        """A target with no opinion, and no task request, asks the minimum."""
+        resolved = resolve_resources(None)
+        assert resolved.cpus_per_task == 1
+        assert (resolved.mem, resolved.time_limit, resolved.gres) == (
+            None,
+            None,
+            None,
+        )
+
+    def test_a_request_supplies_every_directive(self) -> None:
+        """Each portable field lands on its sbatch counterpart."""
+        resolved = resolve_resources(
+            ResourceRequest(cpus=16, gpus=1, memory_gb=64, walltime="24:00:00")
+        )
+        assert resolved.cpus_per_task == 16
+        assert resolved.mem == "64G"
+        assert resolved.time_limit == "24:00:00"
+        assert resolved.gres == "gpu:1"
+
+    def test_explicit_options_win(self) -> None:
+        """The site's own vocabulary is never overridden by a portable hint."""
+        resolved = resolve_resources(
+            ResourceRequest(
+                cpus=16, gpus=1, memory_gb=64, walltime="24:00:00"
+            ),
+            cpus_per_task=8,
+            mem="32G",
+            time_limit="01:00:00",
+            gres="gpu:a100:2",
+        )
+        assert resolved.cpus_per_task == 8
+        assert resolved.mem == "32G"
+        assert resolved.time_limit == "01:00:00"
+        assert resolved.gres == "gpu:a100:2"
+
+    def test_a_request_fills_only_the_gaps(self) -> None:
+        """Overriding one option leaves the others derived."""
+        resolved = resolve_resources(
+            ResourceRequest(cpus=16, memory_gb=64), mem="32G"
+        )
+        assert resolved.mem == "32G"
+        assert resolved.cpus_per_task == 16
+
+    def test_no_gpu_asks_for_no_gres(self) -> None:
+        """A gpus of 0 (the default) must not become `--gres=gpu:0`."""
+        assert resolve_resources(ResourceRequest(cpus=4)).gres is None
+
+    def test_vram_alone_cannot_produce_a_gres(self) -> None:
+        """
+        vram_gb has no portable sbatch flag, so it is dropped rather than
+        guessed at -- a wrong --gres fails the submission outright.
+        """
+        assert resolve_resources(ResourceRequest(vram_gb=40)).gres is None
+
+
+@pytest.mark.unit
+class TestTaskResources:
+    """A bound task's resources reach the submitted script."""
+
+    def test_script_carries_the_tasks_resources(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The portable request alone is enough to size the job."""
+        target = _target(inner, partition="gpu")
+        _bind(
+            target,
+            _Task(
+                str(tmp_path),
+                ResourceRequest(
+                    cpus=16, gpus=1, memory_gb=64, walltime="24:00:00"
+                ),
+            ),
+        )
+        script = target._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        for expected in (
+            "#SBATCH --cpus-per-task=16",
+            "#SBATCH --mem=64G",
+            "#SBATCH --time=24:00:00",
+            "#SBATCH --gres=gpu:1",
+            "#SBATCH --partition=gpu",
+        ):
+            assert expected in script
+
+    def test_the_target_overrides_the_task(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """
+        The site knows things the portable request cannot express (here, that
+        the partition's GPUs must be named), so its value is the one submitted.
+        """
+        target = _target(inner, gres="gpu:RTX6000:1", cpus_per_task=8)
+        _bind(target, _Task(str(tmp_path), ResourceRequest(cpus=16, gpus=1)))
+        script = target._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        assert "#SBATCH --gres=gpu:RTX6000:1" in script
+        assert "#SBATCH --cpus-per-task=8" in script
+        assert "gpu:1" not in script
+
+    def test_a_task_without_resources_changes_nothing(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """`resources` is optional, and omitting it is not an error."""
+        target = _target(inner, mem="8G")
+        _bind(target, _Task(str(tmp_path)))
+        script = target._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        assert "#SBATCH --mem=8G" in script
+        assert "#SBATCH --cpus-per-task=1" in script
+
+    def test_an_unbound_target_still_builds_a_script(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Nothing here may require a task: control-plane work has none."""
+        script = _target(inner)._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        assert "#SBATCH --cpus-per-task=1" in script
+
+    def test_resolved_resources_is_inspectable_before_submitting(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """What the job will ask for is answerable without a scheduler."""
+        target = _target(inner)
+        _bind(target, _Task(str(tmp_path), ResourceRequest(cpus=4, gpus=2)))
+        resolved = target.resolved_resources()
+        assert (resolved.cpus_per_task, resolved.gres) == (4, "gpu:2")
 
 
 @pytest.mark.unit
