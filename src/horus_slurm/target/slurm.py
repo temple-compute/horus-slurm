@@ -39,7 +39,11 @@ from pydantic import Field
 
 from horus_slurm.events import GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
-from horus_slurm.resources import SlurmJobScope
+from horus_slurm.resources import (
+    SbatchResources,
+    SlurmJobScope,
+    resolve_resources,
+)
 
 if TYPE_CHECKING:
     from horus_runtime.core.artifact.base import BaseArtifact
@@ -62,6 +66,22 @@ class SlurmTarget(BaseTarget):
     only adds the Slurm-specific scheduling primitives on top: submitting via
     ``sbatch``, polling via a marker file (with ``squeue`` as a liveness
     fallback), and signalling via ``scancel``.
+
+    Resource requests come from two places and are merged, explicit winning:
+
+    - the task's portable ``resources`` (``cpus``, ``gpus``, ``memory_gb``,
+      ``walltime``), which say what the *work* needs in target-agnostic terms
+      and let one workflow run on any scheduler;
+    - this target's own sbatch fields, which say what to ask *Slurm* for in
+      its own vocabulary, and override the portable hint whenever both apply.
+
+    So a task carrying ``resources: {cpus: 16, gpus: 1, memory_gb: 64}``
+    submits with ``--cpus-per-task=16 --mem=64G --gres=gpu:1`` on a bare
+    ``SlurmTarget(partition="gpu")``, while a target that also sets
+    ``gres="gpu:a100:1"`` keeps its own -- the site knows something about the
+    hardware that the portable request cannot express.
+
+    See :func:`horus_slurm.resources.resolve_resources` for the full mapping.
     """
 
     kind: str = "slurm"
@@ -75,12 +95,20 @@ class SlurmTarget(BaseTarget):
 
     # sbatch options. Extend as needed; extra_sbatch_args covers anything
     # not modeled explicitly (e.g. "--constraint=a100", "--exclusive").
+    #
+    # The four that a task's portable `resources` can also determine
+    # (cpus_per_task, mem, time_limit, gres) default to None, meaning "derive
+    # me". Setting one here is an override that always wins -- see
+    # resolve_resources. They are deliberately None rather than carrying a
+    # concrete default: "was this set explicitly?" has to survive a round trip
+    # through JSON (tc-os stores workflows that way), and pydantic's
+    # model_fields_set does not -- every field comes back as explicitly set.
     partition: str | None = None
     account: str | None = None
     qos: str | None = None
     nodes: int = 1
     ntasks: int = 1
-    cpus_per_task: int = 1
+    cpus_per_task: int | None = None
     mem: str | None = None
     time_limit: str | None = None  # e.g. "01:00:00"
     gres: str | None = None  # e.g. "gpu:1"
@@ -392,6 +420,42 @@ class SlurmTarget(BaseTarget):
 
     # --- helpers -------------------------------------------------------------
 
+    def resolved_resources(self) -> SbatchResources:
+        """
+        The sbatch options this target will actually submit with.
+
+        Merges the bound task's portable ``resources`` into the explicit
+        sbatch fields, explicit winning. ``bind()`` is what makes the task
+        reachable here -- it exists precisely "so resource-aware targets can
+        read ``task.resources`` while provisioning" -- and it runs ahead of
+        dispatch, so the request is available by the time a script is built.
+
+        Public because it is the honest answer to "what will this actually
+        ask Slurm for?", which is worth being able to inspect (a dry run, a
+        UI preview, a test) without submitting anything.
+
+        Note:
+            An unbound target (no task, e.g. a control-plane command) simply
+            resolves to its own explicit fields.
+        """
+        request = self._task.resources if self._task is not None else None
+        if request is not None and request.vram_gb is not None:
+            # No portable translation exists -- see resolve_resources.
+            horus_logger.log.debug(
+                _(
+                    "Ignoring vram_gb=%(vram)s: Slurm has no portable flag "
+                    "for GPU memory. Express it in gres or extra_sbatch_args."
+                )
+                % {"vram": request.vram_gb}
+            )
+        return resolve_resources(
+            request,
+            cpus_per_task=self.cpus_per_task,
+            mem=self.mem,
+            time_limit=self.time_limit,
+            gres=self.gres,
+        )
+
     def _build_sbatch_script(
         self,
         cmd: str,
@@ -400,25 +464,27 @@ class SlurmTarget(BaseTarget):
         env: dict[str, str] | None,
         job_dir: str,
     ) -> str:
+        resolved = self.resolved_resources()
+
         lines = ["#!/bin/bash"]
         lines.append(f"#SBATCH --job-name=horus-{Path(job_dir).name}")
         lines.append(f"#SBATCH --output={job_dir}/stdout.log")
         lines.append(f"#SBATCH --error={job_dir}/stderr.log")
         lines.append(f"#SBATCH --nodes={self.nodes}")
         lines.append(f"#SBATCH --ntasks={self.ntasks}")
-        lines.append(f"#SBATCH --cpus-per-task={self.cpus_per_task}")
+        lines.append(f"#SBATCH --cpus-per-task={resolved.cpus_per_task}")
         if self.partition:
             lines.append(f"#SBATCH --partition={self.partition}")
         if self.account:
             lines.append(f"#SBATCH --account={self.account}")
         if self.qos:
             lines.append(f"#SBATCH --qos={self.qos}")
-        if self.mem:
-            lines.append(f"#SBATCH --mem={self.mem}")
-        if self.time_limit:
-            lines.append(f"#SBATCH --time={self.time_limit}")
-        if self.gres:
-            lines.append(f"#SBATCH --gres={self.gres}")
+        if resolved.mem:
+            lines.append(f"#SBATCH --mem={resolved.mem}")
+        if resolved.time_limit:
+            lines.append(f"#SBATCH --time={resolved.time_limit}")
+        if resolved.gres:
+            lines.append(f"#SBATCH --gres={resolved.gres}")
         for arg in self.extra_sbatch_args:
             lines.append(f"#SBATCH {arg}")
 
