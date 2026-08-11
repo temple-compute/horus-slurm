@@ -566,10 +566,39 @@ class TestOutputAndDelegation:
         assert await _target(inner).read_output(handle) == (b"out", b"err")
 
     async def test_missing_logs_are_empty_not_an_error(
-        self, inner: FakeInner, tmp_path: Path
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A job that has not started yet has written nothing."""
+        """
+        A queued job has not started writing yet, so the logs are not even
+        read: an SSH transport surfaces a missing file as an error, and that
+        must not spam the UI every poll while the job sits in the queue.
+        """
         handle = JobHandle(pid=None, job_dir=str(tmp_path / "nope"))
+        reads: list[str] = []
+
+        async def fail_get_file(_self: FakeInner, path: str) -> bytes:
+            reads.append(path)
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(FakeInner, "get_file", fail_get_file)
+
+        assert await _target(inner).read_output(handle) == (b"", b"")
+        assert reads == []
+
+    async def test_a_transient_log_read_failure_is_not_an_error(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A log that exists but cannot be read right now reads as empty; the
+        next poll retries it.
+        """
+        (tmp_path / "stdout.log").write_text("out")
+        handle = JobHandle(pid=None, job_dir=str(tmp_path))
+
+        async def fail_get_file(_self: FakeInner, _path: str) -> bytes:
+            raise OSError("connection lost")
+
+        monkeypatch.setattr(FakeInner, "get_file", fail_get_file)
 
         assert await _target(inner).read_output(handle) == (b"", b"")
 
