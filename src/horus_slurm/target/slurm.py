@@ -386,23 +386,18 @@ class SlurmTarget(BaseTarget):
         """
         Read job stderr and stdout.
 
+        A queued job has not created its log files yet, so nothing is read
+        until the job is actually running (or done); ``_read_log`` returns
+        empty until the files exist.
+
         ponytail: re-reads both logs whole on every call, and
         ``PollingChannelProcess.stream`` calls this once per poll interval, so
         tailing a long-running chatty job is O(n^2) in log size. Switch to a
         ranged read (``tail -c +offset``) if job logs get large enough to
         matter.
         """
-        stdout, stderr = b"", b""
-        try:
-            stdout = await self._read_log(f"{handle.job_dir}/stdout.log")
-        except Exception:
-            horus_logger.log.info(_("Could not read stdout: {s}"))
-
-        try:
-            stderr = await self._read_log(f"{handle.job_dir}/stderr.log")
-        except Exception:
-            horus_logger.log.info(_("Could not read stderr: {s}"))
-
+        stdout = await self._read_log(f"{handle.job_dir}/stdout.log")
+        stderr = await self._read_log(f"{handle.job_dir}/stderr.log")
         return stdout, stderr
 
     async def send_signal(self, handle: JobHandle, sig: int) -> None:
@@ -500,9 +495,26 @@ class SlurmTarget(BaseTarget):
         return "\n".join(lines) + "\n"
 
     async def _read_log(self, path: str) -> bytes:
+        """
+        Best-effort read of a job log file.
+
+        Slurm only writes the log files once the job starts running, so a
+        missing file is the norm for a queued job, not an error. Existence is
+        probed before reading because transports do not agree on how a missing
+        file surfaces: the SSH transport wraps it in ``TaskExecutionError``
+        rather than ``FileNotFoundError``.
+        """
+        if not await self.inner.path_exists(path):
+            return b""
         try:
             return await self.inner.get_file(path)
-        except FileNotFoundError:
+        except Exception as exc:
+            # A transient read failure is not worth a UI error; the next poll
+            # retries and, until then, empty is honest.
+            horus_logger.log.debug(
+                _("Could not read log %(path)s: %(error)s")
+                % {"path": path, "error": exc}
+            )
             return b""
 
     async def _queue_state(self, handle: JobHandle) -> str | None:
