@@ -9,11 +9,13 @@ Unit tests for SlurmTarget: submission, polling, signalling, and the
 resource scope it declares.
 """
 
+import json
 import signal as signal_mod
 from pathlib import Path
 from typing import Any
 
 import pytest
+from horus_builtin.target.local import LocalTarget
 from horus_runtime.context import HorusContext
 from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
@@ -21,6 +23,7 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.event.base import BaseEvent
 
 from horus_slurm.events import SlurmJobEvent
+from horus_slurm.record import RECORD_FILE, SlurmJobRecord
 from horus_slurm.resources import SlurmJobScope, resolve_resources
 from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
 
@@ -37,10 +40,20 @@ class _Task:
     """The only things the target needs from a task."""
 
     def __init__(
-        self, working_dir: str, resources: ResourceRequest | None = None
+        self,
+        working_dir: str,
+        resources: ResourceRequest | None = None,
+        *,
+        id: str = "task-1",
     ) -> None:
+        self.id = id
         self.working_dir = working_dir
         self.resources = resources
+
+    @property
+    def side_artifacts_dir(self) -> str:
+        """Mirrors ``BaseTask.side_artifacts_dir``."""
+        return f"{self.working_dir}/side-artifacts"
 
 
 def _bind(target: SlurmTarget, task: _Task) -> None:
@@ -441,6 +454,132 @@ class TestQueueState:
         handle = JobHandle(pid=None, job_dir=str(tmp_path))
 
         assert await _target(inner)._queue_state(handle) == expected
+
+
+def _read_record(task: _Task) -> SlurmJobRecord:
+    """Read back the record a target wrote for *task*."""
+    raw = Path(task.side_artifacts_dir, RECORD_FILE).read_bytes()
+    return SlurmJobRecord.model_validate(json.loads(raw))
+
+
+@pytest.mark.unit
+class TestJobRecord:
+    """
+    The durable side-product record, independent of the (truncatable) event
+    stream.
+    """
+
+    async def test_launch_writes_a_record_with_the_submitted_state(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """
+        The script and resolved sbatch options are captured at submit time.
+        """
+        task = _Task(str(tmp_path))
+        target = _target(inner, partition="gpu", mem="8G")
+        _bind(target, task)
+
+        await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        record = _read_record(task)
+        assert record.job_id == "12345"
+        assert record.state == "SUBMITTED"
+        assert [s.state for s in record.states] == ["SUBMITTED"]
+        assert "echo hi" in record.script
+        assert record.sbatch["partition"] == "gpu"
+        assert record.sbatch["mem"] == "8G"
+        assert record.exit_code is None
+
+    async def test_polling_appends_states_without_duplicating_them(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Mirrors the bus's own dedupe (``TestJobEvents``): a repeated state
+        must not grow the record's history.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"PENDING\n"),
+        )
+        target = _target(inner)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        await target.poll(handle)
+        await target.poll(handle)  # still PENDING: no new entry
+        inner.responds(squeue=FakeProcess(stdout=b"RUNNING\n"))
+        await target.poll(handle)
+
+        record = _read_record(task)
+        assert [s.state for s in record.states] == [
+            "SUBMITTED",
+            "PENDING",
+            "RUNNING",
+        ]
+
+    async def test_a_recorded_exit_code_is_persisted(
+        self, tmp_path: Path
+    ) -> None:
+        """An observer reading the record alone can tell the job is done."""
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b""),
+        )
+        target = _target(inner)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        (Path(handle.job_dir) / "exit_code").write_text("0")
+
+        exit_code = await target.poll(handle)
+
+        assert exit_code == 0
+        assert _read_record(task).exit_code == 0
+
+    async def test_a_failed_write_never_breaks_launch_or_poll(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Recording is strictly best-effort, like every other observation this
+        target makes: a broken filesystem must not fail the job.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"PENDING\n"),
+        )
+        target = _target(inner)
+        _bind(target, task)
+
+        real_put_file = LocalTarget.put_file
+
+        async def flaky_put_file(
+            self: FakeInner, content: bytes | Path, remote_path: str
+        ) -> None:
+            # Only the record write is allowed to fail -- everything else
+            # (the sbatch script, the job-id marker) must still land, or the
+            # test would not be exercising "recording is best-effort" at all.
+            if remote_path.endswith(RECORD_FILE):
+                raise OSError("disk full")
+            await real_put_file(self, content, remote_path)
+
+        # inner is a pydantic model: patch the class, not the instance --
+        # pydantic's __setattr__ rejects assigning a non-field attribute.
+        monkeypatch.setattr(FakeInner, "put_file", flaky_put_file)
+
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        assert await target.poll(handle) is None
 
 
 @pytest.mark.unit

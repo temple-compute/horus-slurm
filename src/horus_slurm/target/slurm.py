@@ -39,6 +39,7 @@ from pydantic import Field
 
 from horus_slurm.events import GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
+from horus_slurm.record import RECORD_FILE, SlurmJobRecord
 from horus_slurm.resources import (
     SbatchResources,
     SlurmJobScope,
@@ -130,6 +131,12 @@ class SlurmTarget(BaseTarget):
     """
     Last queue state announced on the bus, so ``poll`` emits on transitions
     rather than once per poll.
+    """
+
+    _record: SlurmJobRecord | None = None
+    """
+    The job's durable record, rewritten on every state transition and exit
+    code observation. ``None`` until ``launch()`` submits the job.
     """
 
     # --- placement identity -------------------------------------------------
@@ -250,7 +257,20 @@ class SlurmTarget(BaseTarget):
         raw_id = out.decode().strip()
         job_id = raw_id.split(";", 1)[0]
         await self._publish_job_id(job_id, cwd=cwd)
-        self._announce(job_id, SUBMITTED)
+
+        target_cwd = cwd or self.resolved_working_directory
+        self._record = SlurmJobRecord(
+            job_id=job_id,
+            state=SUBMITTED,
+            script=script,
+            script_path=script_path,
+            working_dir=target_cwd,
+            job_dir=job_dir,
+            stdout_path=f"{job_dir}/stdout.log",
+            stderr_path=f"{job_dir}/stderr.log",
+            sbatch=self._sbatch_summary(),
+        )
+        await self._announce(job_id, SUBMITTED)
 
         # pid stays None: a job id is not a process id.
         return JobHandle(
@@ -281,17 +301,21 @@ class SlurmTarget(BaseTarget):
                 % {"err": exc}
             )
 
-    def _announce(self, job_id: str, state: str) -> None:
+    async def _announce(self, job_id: str, state: str) -> None:
         """
-        Publish a job state on the event bus, if it changed. Best effort.
+        Publish a job state on the event bus and record it, if it changed.
 
-        Nothing here may fail a job: there is no bus at all outside a Horus
-        context (the plain CLI), and a subscriber that raises is the
-        subscriber's problem, not this job's.
+        Best effort throughout: nothing here may fail a job. There is no bus
+        at all outside a Horus context (the plain CLI), and a subscriber that
+        raises is the subscriber's problem, not this job's; likewise a
+        failure to persist the record costs a stale observation, not the job.
         """
         if state == self._last_state:
             return
         self._last_state = state
+        if self._record is not None:
+            self._record = self._record.with_state(state)
+            await self._write_record()
         try:
             HorusContext.get_context().bus.emit(
                 SlurmJobEvent(
@@ -306,6 +330,40 @@ class SlurmTarget(BaseTarget):
             horus_logger.log.debug(
                 _("Could not announce Slurm job state: %(err)s") % {"err": exc}
             )
+
+    async def _write_record(self) -> None:
+        """
+        Persist the current job record as a side product. Best effort: an
+        unbound target (no task) or a write failure just means observers see
+        a stale or absent record until the next transition.
+        """
+        if self._task is None or self._record is None:
+            return
+        try:
+            await self.inner.put_file(
+                self._record.model_dump_json().encode(),
+                f"{self._task.side_artifacts_dir}/{RECORD_FILE}",
+            )
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not record Slurm job state: %(err)s") % {"err": exc}
+            )
+
+    def _sbatch_summary(self) -> dict[str, str | int | list[str] | None]:
+        """The sbatch options this job was actually submitted with."""
+        resolved = self.resolved_resources()
+        return {
+            "partition": self.partition,
+            "account": self.account,
+            "qos": self.qos,
+            "nodes": self.nodes,
+            "ntasks": self.ntasks,
+            "cpus_per_task": resolved.cpus_per_task,
+            "mem": resolved.mem,
+            "time_limit": resolved.time_limit,
+            "gres": resolved.gres,
+            "extra_sbatch_args": list(self.extra_sbatch_args),
+        }
 
     async def resource_scope(
         self, task: BaseTask, process: ChannelProcess | None = None
@@ -332,11 +390,13 @@ class SlurmTarget(BaseTarget):
         # between two polls would otherwise never report having run.
         state = await self._queue_state(handle)
         if state:
-            self._announce(job_id, state)
+            await self._announce(job_id, state)
 
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
-            return int(raw.decode().strip())
+            exit_code = int(raw.decode().strip())
+            await self._record_exit_code(exit_code)
+            return exit_code
 
         if state == "":
             # Left the queue without exit_code visible yet. This can be a race:
@@ -344,17 +404,25 @@ class SlurmTarget(BaseTarget):
             # disappears from squeue. Retry briefly before concluding it was
             # killed by the scheduler (OOM, node failure, wall-time) or
             # cancelled outside Horus.
-            exit_code = await self._retry_exit_code(exit_code_path)
-            if exit_code is not None:
-                return exit_code
+            retried_code = await self._retry_exit_code(exit_code_path)
+            if retried_code is not None:
+                await self._record_exit_code(retried_code)
+                return retried_code
 
-            self._announce(job_id, GONE)
+            await self._announce(job_id, GONE)
             horus_logger.log.error(
                 _("The job vanished from queue without writting an exit code.")
             )
             return 1
 
         return None
+
+    async def _record_exit_code(self, exit_code: int) -> None:
+        """Persist the job's exit code on its record. Best effort."""
+        if self._record is None:
+            return
+        self._record = self._record.model_copy(update={"exit_code": exit_code})
+        await self._write_record()
 
     async def _retry_exit_code(
         self,
