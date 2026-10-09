@@ -672,9 +672,75 @@ class TestSignalling:
         )
         await _target(inner).send_signal(handle, signal_mod.SIGTERM)
 
-        assert inner.commands_starting("scancel") == [
-            "scancel --signal=TERM 999"
+        assert inner.commands_starting("scancel") == ["scancel 999"]
+
+    async def test_a_cancel_is_recorded_straight_away(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """
+        Slurm can take a while to wind a job down; until it reports how the
+        job ended, the record says a cancel is under way.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n")
+        )
+        target = _target(inner)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        await target.send_signal(handle, signal_mod.SIGKILL)
+
+        assert _read_record(task).state == "CANCELLING"
+        assert emitted[-1].state == "CANCELLING"
+
+    async def test_a_cancelled_job_ends_with_its_accounted_state(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A cancelled job never writes an exit code: sacct says how it ended,
+        without waiting out the exit-code retries.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"CANCELLED by 1000\n"),
+        )
+        target = _target(inner, exit_code_delay=3600.0)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        await target.send_signal(handle, signal_mod.SIGKILL)
+
+        assert await target.poll(handle) == 1
+        assert [s.state for s in _read_record(task).states][-2:] == [
+            "CANCELLING",
+            "CANCELLED",
         ]
+
+    async def test_a_cancel_without_accounting_still_ends_cancelled(
+        self, tmp_path: Path
+    ) -> None:
+        """A cluster without slurmdbd cannot answer sacct; it was cancelled."""
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(returncode=1),
+        )
+        target = _target(inner, exit_code_delay=3600.0)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        await target.send_signal(handle, signal_mod.SIGTERM)
+
+        assert await target.poll(handle) == 1
+        assert _read_record(task).state == "CANCELLED"
 
     async def test_unknown_signal_falls_back_to_term(
         self, inner: FakeInner, tmp_path: Path
