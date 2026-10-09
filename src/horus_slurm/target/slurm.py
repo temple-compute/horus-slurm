@@ -37,7 +37,7 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
 from pydantic import Field
 
-from horus_slurm.events import GONE, SUBMITTED, SlurmJobEvent
+from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
 from horus_slurm.record import RECORD_FILE, SlurmJobRecord
 from horus_slurm.resources import (
@@ -131,6 +131,12 @@ class SlurmTarget(BaseTarget):
     """
     Last queue state announced on the bus, so ``poll`` emits on transitions
     rather than once per poll.
+    """
+
+    _cancelling: bool = False
+    """
+    Set once ``send_signal`` has cancelled the job, so ``poll`` asks
+    accounting how it ended instead of waiting out the exit-code retries.
     """
 
     _record: SlurmJobRecord | None = None
@@ -398,6 +404,14 @@ class SlurmTarget(BaseTarget):
             await self._record_exit_code(exit_code)
             return exit_code
 
+        if state == "" and self._cancelling:
+            # A cancelled job never writes exit_code, so waiting for one only
+            # outlasts the caller's grace period and loses the final record.
+            await self._announce(
+                job_id, await self._final_state(handle) or "CANCELLED"
+            )
+            return 1
+
         if state == "":
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
@@ -472,12 +486,22 @@ class SlurmTarget(BaseTarget):
         """
         Send signal to the job.
         """
+        job_id = self._handle_job_id(handle)
+        if sig in (signal.SIGKILL, signal.SIGTERM):
+            # A plain scancel ends the whole job, batch step included, and
+            # Slurm accounts for it as CANCELLED. ``--signal`` only reaches
+            # the batch step with ``--full``.
+            proc = await self.inner.run_command_sync(f"scancel {job_id}")
+            await proc.wait()
+            self._cancelling = True
+            await self._announce(job_id, CANCELLING)
+            return
         try:
             name = signal.Signals(sig).name.removeprefix("SIG")
         except ValueError:
             name = "TERM"
         proc = await self.inner.run_command_sync(
-            f"scancel --signal={name} {self._handle_job_id(handle)}"
+            f"scancel --signal={name} {job_id}"
         )
         await proc.wait()
 
@@ -607,6 +631,23 @@ class SlurmTarget(BaseTarget):
         # A job array reports one line per element; the first is enough for a
         # single job, which is all this target submits.
         return text.splitlines()[0].strip()
+
+    async def _final_state(self, handle: JobHandle) -> str | None:
+        """
+        How ``sacct`` says the job ended (``CANCELLED``, ``TIMEOUT``, …).
+
+        ``None`` when accounting cannot answer: a nonzero exit (no slurmdbd)
+        or nothing recorded yet. ``sacct`` appends who cancelled a job
+        (``CANCELLED by 1000``), so only the first word is the state.
+        """
+        proc = await self.inner.run_command_sync(
+            f"sacct -n -X -P -j {self._handle_job_id(handle)} -o State"
+        )
+        out, _err = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        words = out.decode(errors="replace").split()
+        return words[0] if words else None
 
 
 # --- Known limitations / next steps -----------------------------------------
