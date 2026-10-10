@@ -9,7 +9,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: horus-slurm VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-06-10 23:42+0200\n"
+"POT-Creation-Date: 2026-10-10 18:36+0200\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -18,10 +18,68 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Generated-By: Babel 2.18.0\n"
 
-#: src/horus_slurm/executor/slurm.py:24
-msgid "Slurm Target"
+#: src/horus_slurm/probe.py:174
+#, python-format
+msgid "Could not read Slurm accounting: %(err)s"
 msgstr ""
 
-#: src/horus_slurm/executor/slurm.py:25
-msgid "Run tasks on Slurm clusters."
+#: src/horus_slurm/probe.py:183
+#, python-format
+msgid "No Slurm job id for task %(task)s; no accounting read"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:98
+msgid "Submit jobs to a Slurm cluster via sbatch"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:265
+#, python-format
+msgid "sbatch submission failed: %(error)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:315
+#, python-format
+msgid "Could not record job id for observation: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:341
+#, python-format
+msgid "Slurm job %(job_id)s is %(state)s (%(reason)s)"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:347
+#, python-format
+msgid "Slurm job %(job_id)s is %(state)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:364
+#, python-format
+msgid "Could not announce Slurm job state: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:382
+#, python-format
+msgid "Could not record Slurm job state: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:462
+#, python-format
+msgid "The job vanished from queue without writing an exit code (%(state)s)."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:490
+#, python-format
+msgid "Retrying exit_code fetch, attempt %(attempt)d/%(attempts)d..."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:570
+#, python-format
+msgid ""
+"Ignoring vram_gb=%(vram)s: Slurm has no portable flag for GPU memory. "
+"Express it in gres or extra_sbatch_args."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:644
+#, python-format
+msgid "Could not read log %(path)s: %(error)s"
 msgstr ""

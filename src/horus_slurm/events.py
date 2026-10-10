@@ -56,3 +56,17 @@ class SlurmJobEvent(BaseEvent):
     task_id: str
     job_id: str
     state: str
+    reason: str | None = None
+    """
+    Why the job is in ``state``: squeue's parenthesised ``%R`` with the
+    parentheses stripped (``Resources``, ``Priority``,
+    ``ReqNodeNotAvail, UnavailableNodes:gpu[01-02]``), or sacct's ``Reason``
+    once the job has ended. ``None`` when Slurm gives none.
+    """
+    nodes: str | None = None
+    """The node list (squeue's unparenthesised ``%R``) while the job runs."""
+    partition_nodes: dict[str, int] | None = None
+    """
+    Node state -> count for the job's partition (``{"idle": 0, "drained":
+    2}``), only while it is pending on a resource or node reason.
+    """

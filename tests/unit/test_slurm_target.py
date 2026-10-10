@@ -25,7 +25,7 @@ from horus_runtime.event.base import BaseEvent
 from horus_slurm.events import SlurmJobEvent
 from horus_slurm.record import RECORD_FILE, SlurmJobRecord
 from horus_slurm.resources import SlurmJobScope, resolve_resources
-from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
+from horus_slurm.target.slurm import JOB_ID_FILE, QueueState, SlurmTarget
 
 from .conftest import FakeInner, FakeProcess
 
@@ -431,13 +431,28 @@ class TestQueueState:
     @pytest.mark.parametrize(
         ("stdout", "returncode", "expected"),
         [
-            (b"PENDING\n", 0, "PENDING"),
-            (b"", 0, ""),
+            (b"PENDING|(Resources)\n", 0, QueueState("PENDING", "Resources")),
+            (
+                b"PENDING|(ReqNodeNotAvail, UnavailableNodes:gpu[01-02])\n",
+                0,
+                QueueState(
+                    "PENDING", "ReqNodeNotAvail, UnavailableNodes:gpu[01-02]"
+                ),
+            ),
+            # Slurm's "no reason" is not a reason.
+            (b"PENDING|(None)\n", 0, QueueState("PENDING")),
+            # Unparenthesised %R is where a running job is.
+            (b"RUNNING|node01\n", 0, QueueState("RUNNING", nodes="node01")),
+            (b"", 0, QueueState("")),
             # A blip must be "don't know", never "gone": the caller treats
             # gone as a failure.
             (b"", 1, None),
             # Array elements report one line each; the first is enough.
-            (b"RUNNING\nRUNNING\n", 0, "RUNNING"),
+            (
+                b"RUNNING|node01\nRUNNING|node02\n",
+                0,
+                QueueState("RUNNING", nodes="node01"),
+            ),
         ],
     )
     async def test_squeue_output_is_read_correctly(
@@ -445,7 +460,7 @@ class TestQueueState:
         tmp_path: Path,
         stdout: bytes,
         returncode: int,
-        expected: str | None,
+        expected: QueueState | None,
     ) -> None:
         """Present, gone, and unknown are three different answers."""
         inner = FakeInner(working_directory=str(tmp_path)).responds(
@@ -543,6 +558,54 @@ class TestJobRecord:
         assert exit_code == 0
         assert _read_record(task).exit_code == 0
 
+    async def test_reason_and_nodes_are_recorded(self, tmp_path: Path) -> None:
+        """The record says why a job waits, and where it then runs."""
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"PENDING|(Resources)\n"),
+        )
+        target = _target(inner)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        await target.poll(handle)
+        record = _read_record(task)
+        assert (record.reason, record.nodes) == ("Resources", None)
+        assert record.states[-1].reason == "Resources"
+
+        inner.responds(squeue=FakeProcess(stdout=b"RUNNING|node01\n"))
+        await target.poll(handle)
+        record = _read_record(task)
+        assert (record.state, record.reason, record.nodes) == (
+            "RUNNING",
+            None,
+            "node01",
+        )
+
+    def test_an_old_record_without_the_new_fields_still_parses(self) -> None:
+        """Records written by horus-slurm 0.4.0 must keep validating."""
+        record = SlurmJobRecord.model_validate(
+            {
+                "job_id": "1",
+                "state": "PENDING",
+                "states": [{"state": "PENDING", "at": "2026-01-01T00:00:00Z"}],
+                "script": "",
+                "script_path": "job.sh",
+                "working_dir": "/w",
+                "job_dir": "/w/j",
+                "stdout_path": "/w/j/stdout.log",
+                "stderr_path": "/w/j/stderr.log",
+            }
+        )
+
+        assert record.reason is None
+        assert record.nodes is None
+        assert record.partition_nodes is None
+        assert record.states[0].reason is None
+
     async def test_a_failed_write_never_breaks_launch_or_poll(
         self,
         tmp_path: Path,
@@ -624,6 +687,36 @@ class TestJobEvents:
 
         assert [e.state for e in emitted] == ["PENDING", "RUNNING"]
 
+    async def test_a_changed_pending_reason_is_announced(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """
+        Still PENDING, but now for a different reason: that is news to a user
+        wondering why the job has not started.
+        """
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b"PENDING|(Priority)\n")
+        )
+        target = _target(inner)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        await target.poll(handle)
+        await target.poll(handle)
+        inner.responds(squeue=FakeProcess(stdout=b"PENDING|(Resources)\n"))
+        await target.poll(handle)
+        inner.responds(squeue=FakeProcess(stdout=b"RUNNING|node01\n"))
+        await target.poll(handle)
+
+        assert [(e.state, e.reason, e.nodes) for e in emitted] == [
+            ("PENDING", "Priority", None),
+            ("PENDING", "Resources", None),
+            ("RUNNING", None, "node01"),
+        ]
+        assert emitted[0].message == "Slurm job 12345 is PENDING (Priority)"
+        assert emitted[-1].message == "Slurm job 12345 is RUNNING"
+
     async def test_vanishing_without_an_exit_code_is_announced(
         self, tmp_path: Path, emitted: list[SlurmJobEvent]
     ) -> None:
@@ -638,6 +731,56 @@ class TestJobEvents:
 
         assert await target.poll(handle) == 1
         assert [e.state for e in emitted] == ["GONE"]
+
+    async def test_vanishing_announces_the_accounted_end_state(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """Accounting knows what killed it; that beats a bare GONE."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"TIMEOUT|0:0|None\n"),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) == 1
+        assert [(e.state, e.reason) for e in emitted] == [("TIMEOUT", None)]
+
+    async def test_vanishing_keeps_the_accounted_reason(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """The accounted Reason travels with the end state."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"NODE_FAIL|0:0|NodeDown\n"),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) == 1
+        assert [(e.state, e.reason) for e in emitted] == [
+            ("NODE_FAIL", "NodeDown")
+        ]
+
+    async def test_vanishing_without_accounting_is_gone(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """No slurmdbd, no answer: all that is known is that it is gone."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(returncode=1),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) == 1
+        assert [(e.state, e.reason) for e in emitted] == [("GONE", None)]
 
     async def test_announcing_never_breaks_a_poll(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -23,7 +23,7 @@ import asyncio
 import shlex
 import signal
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 from horus_builtin.target.local import LocalTarget
 from horus_runtime.context import HorusContext
@@ -55,6 +55,14 @@ JOB_ID_FILE = ".horus_slurm_job_id"
 """
 File under the task working directory holding the submitted job's id.
 """
+
+
+class QueueState(NamedTuple):
+    """One ``squeue`` reading of a job; ``state`` is ``""`` once it is gone."""
+
+    state: str
+    reason: str | None = None
+    nodes: str | None = None
 
 
 class SlurmTarget(BaseTarget):
@@ -127,10 +135,11 @@ class SlurmTarget(BaseTarget):
     exit_code_retries: int = 5
     exit_code_delay: float = 5.0
 
-    _last_state: str | None = None
+    _last_state: tuple[str, str | None] | None = None
     """
-    Last queue state announced on the bus, so ``poll`` emits on transitions
-    rather than once per poll.
+    Last (state, reason) announced on the bus, so ``poll`` emits on
+    transitions -- including a pending job's reason changing -- rather than
+    once per poll.
     """
 
     _cancelling: bool = False
@@ -307,7 +316,13 @@ class SlurmTarget(BaseTarget):
                 % {"err": exc}
             )
 
-    async def _announce(self, job_id: str, state: str) -> None:
+    async def _announce(
+        self,
+        job_id: str,
+        state: str,
+        reason: str | None = None,
+        nodes: str | None = None,
+    ) -> None:
         """
         Publish a job state on the event bus and record it, if it changed.
 
@@ -316,20 +331,32 @@ class SlurmTarget(BaseTarget):
         raises is the subscriber's problem, not this job's; likewise a
         failure to persist the record costs a stale observation, not the job.
         """
-        if state == self._last_state:
+        if (state, reason) == self._last_state:
             return
-        self._last_state = state
+        self._last_state = (state, reason)
         if self._record is not None:
-            self._record = self._record.with_state(state)
+            self._record = self._record.with_state(state, reason, nodes)
             await self._write_record()
+        if reason:
+            message = _("Slurm job %(job_id)s is %(state)s (%(reason)s)") % {
+                "job_id": job_id,
+                "state": state,
+                "reason": reason,
+            }
+        else:
+            message = _("Slurm job %(job_id)s is %(state)s") % {
+                "job_id": job_id,
+                "state": state,
+            }
         try:
             HorusContext.get_context().bus.emit(
                 SlurmJobEvent(
                     task_id=self._task.id if self._task is not None else "",
                     job_id=job_id,
                     state=state,
-                    message=_("Slurm job %(job_id)s is %(state)s")
-                    % {"job_id": job_id, "state": state},
+                    reason=reason,
+                    nodes=nodes,
+                    message=message,
                 )
             )
         except Exception as exc:
@@ -394,9 +421,10 @@ class SlurmTarget(BaseTarget):
 
         # Announce before the exit_code short-circuit: a job that finishes
         # between two polls would otherwise never report having run.
-        state = await self._queue_state(handle)
-        if state:
-            await self._announce(job_id, state)
+        queue = await self._queue_state(handle)
+        state = queue.state if queue is not None else None
+        if queue is not None and queue.state:
+            await self._announce(job_id, *queue)
 
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
@@ -407,9 +435,8 @@ class SlurmTarget(BaseTarget):
         if state == "" and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
-            await self._announce(
-                job_id, await self._final_state(handle) or "CANCELLED"
-            )
+            final = await self._final_state(handle)
+            await self._announce(job_id, *(final or ("CANCELLED", None)))
             return 1
 
         if state == "":
@@ -423,9 +450,19 @@ class SlurmTarget(BaseTarget):
                 await self._record_exit_code(retried_code)
                 return retried_code
 
-            await self._announce(job_id, GONE)
+            # sacct usually knows what killed it (TIMEOUT, OUT_OF_MEMORY,
+            # NODE_FAIL, ...); GONE only when accounting cannot say.
+            final_state, reason = await self._final_state(handle) or (
+                GONE,
+                None,
+            )
+            await self._announce(job_id, final_state, reason)
             horus_logger.log.error(
-                _("The job vanished from queue without writting an exit code.")
+                _(
+                    "The job vanished from queue without writing an exit "
+                    "code (%(state)s)."
+                )
+                % {"state": final_state}
             )
             return 1
 
@@ -609,45 +646,62 @@ class SlurmTarget(BaseTarget):
             )
             return b""
 
-    async def _queue_state(self, handle: JobHandle) -> str | None:
+    async def _queue_state(self, handle: JobHandle) -> QueueState | None:
         """
         What ``squeue`` says about the job right now.
 
-        Returns the state string (``PENDING``, ``RUNNING``, …), ``""`` when the
-        job is no longer in the queue, or ``None`` when squeue could not
-        answer. Only an empty *successful* result means gone -- a nonzero exit
-        (e.g. a slurmctld hiccup) must NOT be read that way, or a transient
-        scheduler blip will fail jobs that are still fine.
+        Returns the state (``PENDING``, ``RUNNING``, …) with ``%R`` split into
+        a reason (parenthesised, e.g. ``(Resources)``) or a node list (a
+        running job's ``node01``); a state of ``""`` when the job is no longer
+        in the queue; or ``None`` when squeue could not answer. Only an empty
+        *successful* result means gone -- a nonzero exit (e.g. a slurmctld
+        hiccup) must NOT be read that way, or a transient scheduler blip will
+        fail jobs that are still fine.
         """
         proc = await self.inner.run_command_sync(
-            f"squeue -h -j {self._handle_job_id(handle)} -o %T"
+            f'squeue -h -j {self._handle_job_id(handle)} -o "%T|%R"'
         )
         out, _err = await proc.communicate()
         if proc.returncode != 0:
             return None
         text = out.decode(errors="replace").strip()
         if not text:
-            return ""
+            return QueueState("")
         # A job array reports one line per element; the first is enough for a
         # single job, which is all this target submits.
-        return text.splitlines()[0].strip()
+        state, _sep, where = text.splitlines()[0].strip().partition("|")
+        if where.startswith("(") and where.endswith(")"):
+            reason = where[1:-1]
+            return QueueState(state, None if reason == "None" else reason)
+        return QueueState(state, nodes=where or None)
 
-    async def _final_state(self, handle: JobHandle) -> str | None:
+    async def _final_state(
+        self, handle: JobHandle
+    ) -> tuple[str, str | None] | None:
         """
-        How ``sacct`` says the job ended (``CANCELLED``, ``TIMEOUT``, …).
+        How ``sacct`` says the job ended (``CANCELLED``, ``TIMEOUT``, …), and
+        its recorded reason, if any.
 
         ``None`` when accounting cannot answer: a nonzero exit (no slurmdbd)
         or nothing recorded yet. ``sacct`` appends who cancelled a job
         (``CANCELLED by 1000``), so only the first word is the state.
         """
         proc = await self.inner.run_command_sync(
-            f"sacct -n -X -P -j {self._handle_job_id(handle)} -o State"
+            f"sacct -n -X -P -j {self._handle_job_id(handle)} "
+            "-o State,ExitCode,Reason"
         )
         out, _err = await proc.communicate()
         if proc.returncode != 0:
             return None
-        words = out.decode(errors="replace").split()
-        return words[0] if words else None
+        lines = out.decode(errors="replace").strip().splitlines()
+        if not lines:
+            return None
+        state, _code, reason = [*lines[0].split("|"), "", ""][:3]
+        words = state.split()
+        if not words:
+            return None
+        reason = reason.strip()
+        return words[0], None if reason in ("", "None") else reason
 
 
 # --- Known limitations / next steps -----------------------------------------
