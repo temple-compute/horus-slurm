@@ -25,6 +25,7 @@ from horus_runtime.event.base import BaseEvent
 from horus_slurm.events import SlurmJobEvent
 from horus_slurm.record import RECORD_FILE, SlurmJobRecord
 from horus_slurm.resources import SlurmJobScope, resolve_resources
+from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import JOB_ID_FILE, QueueState, SlurmTarget
 
 from .conftest import FakeInner, FakeProcess
@@ -447,6 +448,12 @@ class TestQueueState:
             # A blip must be "don't know", never "gone": the caller treats
             # gone as a failure.
             (b"", 1, None),
+            # %P, when present, is the partition the job is queued on.
+            (
+                b"PENDING|(Resources)|gpu\n",
+                0,
+                QueueState("PENDING", "Resources", partition="gpu"),
+            ),
             # Array elements report one line each; the first is enough.
             (
                 b"RUNNING|node01\nRUNNING|node02\n",
@@ -800,6 +807,123 @@ class TestJobEvents:
         handle = JobHandle(pid=None, job_dir=str(tmp_path))
 
         assert await _target(inner).poll(handle) is None
+
+
+@pytest.mark.unit
+class TestPartitionSummary:
+    """A job waiting on hardware says what state that hardware is in."""
+
+    SINFO = b"idle|0\nmixed|1\ndrained*|1\ndrained|1\n"
+
+    async def _pending(
+        self, tmp_path: Path, **kwargs: Any
+    ) -> tuple[FakeInner, SlurmTarget, JobHandle, _Task]:
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"PENDING|(Resources)|gpu\n"),
+            sinfo=FakeProcess(stdout=self.SINFO),
+        )
+        target = _target(inner, **kwargs)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        return inner, target, handle, task
+
+    async def test_drained_nodes_surface(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """Counts are summed per base state, flags stripped."""
+        inner, target, handle, task = await self._pending(tmp_path)
+
+        await target.poll(handle)
+        await target.poll(handle)
+
+        expected = {"idle": 0, "mixed": 1, "drained": 2}
+        assert emitted[-1].partition_nodes == expected
+        assert _read_record(task).partition_nodes == expected
+        # squeue's partition, and only once within the interval.
+        assert inner.commands_starting("sinfo") == [
+            'sinfo -h -p gpu -o "%T|%D"'
+        ]
+
+    async def test_the_submitted_partition_wins(self, tmp_path: Path) -> None:
+        """What sbatch was told beats what squeue echoes back."""
+        inner, target, handle, _task = await self._pending(
+            tmp_path, partition="a100"
+        )
+
+        await target.poll(handle)
+
+        assert inner.commands_starting("sinfo") == [
+            'sinfo -h -p a100 -o "%T|%D"'
+        ]
+
+    async def test_only_a_changed_summary_is_announced(
+        self,
+        tmp_path: Path,
+        emitted: list[SlurmJobEvent],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Re-reading the same counts is no news; a node draining is, but it is
+        not a new state in the history.
+        """
+        monkeypatch.setattr(slurm_mod, "PARTITION_SUMMARY_INTERVAL", 0.0)
+        inner, target, handle, task = await self._pending(tmp_path)
+
+        await target.poll(handle)
+        await target.poll(handle)
+        assert len(inner.commands_starting("sinfo")) == 2
+        assert [e.state for e in emitted] == ["SUBMITTED", "PENDING"]
+
+        inner.responds(sinfo=FakeProcess(stdout=b"drained|3\n"))
+        await target.poll(handle)
+
+        assert [e.partition_nodes for e in emitted[1:]] == [
+            {"idle": 0, "mixed": 1, "drained": 2},
+            {"drained": 3},
+        ]
+        record = _read_record(task)
+        assert record.partition_nodes == {"drained": 3}
+        assert [s.state for s in record.states] == ["SUBMITTED", "PENDING"]
+
+    async def test_a_sinfo_failure_leaves_none(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """Best effort: no summary, and the job carries on."""
+        inner, target, handle, _task = await self._pending(tmp_path)
+        inner.responds(sinfo=FakeProcess(returncode=1))
+
+        assert await target.poll(handle) is None
+        assert emitted[-1].state == "PENDING"
+        assert emitted[-1].partition_nodes is None
+
+    async def test_running_clears_it(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """Once the job has nodes, the partition's are beside the point."""
+        inner, target, handle, task = await self._pending(tmp_path)
+        await target.poll(handle)
+
+        inner.responds(squeue=FakeProcess(stdout=b"RUNNING|gpu01|gpu\n"))
+        await target.poll(handle)
+        await target.poll(handle)
+
+        assert emitted[-1].state == "RUNNING"
+        assert emitted[-1].partition_nodes is None
+        assert _read_record(task).partition_nodes is None
+        assert len(inner.commands_starting("sinfo")) == 1
+
+    async def test_other_reasons_do_not_ask(self, tmp_path: Path) -> None:
+        """Waiting on priority says nothing about the nodes."""
+        inner, target, handle, _task = await self._pending(tmp_path)
+        inner.responds(squeue=FakeProcess(stdout=b"PENDING|(Priority)|gpu\n"))
+
+        await target.poll(handle)
+
+        assert inner.commands_starting("sinfo") == []
 
 
 @pytest.mark.unit

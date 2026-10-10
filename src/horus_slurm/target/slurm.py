@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import signal
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
@@ -56,6 +57,23 @@ JOB_ID_FILE = ".horus_slurm_job_id"
 File under the task working directory holding the submitted job's id.
 """
 
+NODE_REASONS = (
+    "Resources",
+    "ReqNodeNotAvail",
+    "PartitionDown",
+    "PartitionInactive",
+    "PartitionNodeLimit",
+    "Nodes_required_for_job_are_DOWN",
+)
+"""
+Pending reasons (matched by prefix) worth a look at the partition's nodes: the
+job waits on hardware, and whether that hardware is busy, drained or down is
+what the user needs to know next.
+"""
+
+PARTITION_SUMMARY_INTERVAL = 60.0
+"""Seconds between ``sinfo`` reads while the pending reason is unchanged."""
+
 
 class QueueState(NamedTuple):
     """One ``squeue`` reading of a job; ``state`` is ``""`` once it is gone."""
@@ -63,6 +81,7 @@ class QueueState(NamedTuple):
     state: str
     reason: str | None = None
     nodes: str | None = None
+    partition: str | None = None
 
 
 class SlurmTarget(BaseTarget):
@@ -135,12 +154,21 @@ class SlurmTarget(BaseTarget):
     exit_code_retries: int = 5
     exit_code_delay: float = 5.0
 
-    _last_state: tuple[str, str | None] | None = None
+    _last_state: tuple[str, str | None, dict[str, int] | None] | None = None
     """
-    Last (state, reason) announced on the bus, so ``poll`` emits on
-    transitions -- including a pending job's reason changing -- rather than
-    once per poll.
+    Last (state, reason, partition_nodes) announced on the bus, so ``poll``
+    emits on transitions -- including a pending job's reason or its
+    partition's node states changing -- rather than once per poll.
     """
+
+    _partition_checked: tuple[str, float] | None = None
+    """
+    (reason, monotonic time) of the last ``sinfo`` read, to re-read only when
+    the pending reason changes or the summary is stale.
+    """
+
+    _partition_nodes: dict[str, int] | None = None
+    """The last ``sinfo`` summary, reused until it is due again."""
 
     _cancelling: bool = False
     """
@@ -322,20 +350,36 @@ class SlurmTarget(BaseTarget):
         state: str,
         reason: str | None = None,
         nodes: str | None = None,
+        partition_nodes: dict[str, int] | None = None,
     ) -> None:
         """
         Publish a job state on the event bus and record it, if it changed.
+
+        A change in ``partition_nodes`` alone is announced and recorded too
+        (the UI refreshes on events), but is not a new entry in the state
+        history.
 
         Best effort throughout: nothing here may fail a job. There is no bus
         at all outside a Horus context (the plain CLI), and a subscriber that
         raises is the subscriber's problem, not this job's; likewise a
         failure to persist the record costs a stale observation, not the job.
         """
-        if (state, reason) == self._last_state:
+        if (state, reason, partition_nodes) == self._last_state:
             return
-        self._last_state = (state, reason)
+        transition = self._last_state is None or self._last_state[:2] != (
+            state,
+            reason,
+        )
+        self._last_state = (state, reason, partition_nodes)
         if self._record is not None:
-            self._record = self._record.with_state(state, reason, nodes)
+            record = (
+                self._record.with_state(state, reason, nodes)
+                if transition
+                else self._record
+            )
+            self._record = record.model_copy(
+                update={"partition_nodes": partition_nodes}
+            )
             await self._write_record()
         if reason:
             message = _("Slurm job %(job_id)s is %(state)s (%(reason)s)") % {
@@ -356,6 +400,7 @@ class SlurmTarget(BaseTarget):
                     state=state,
                     reason=reason,
                     nodes=nodes,
+                    partition_nodes=partition_nodes,
                     message=message,
                 )
             )
@@ -424,7 +469,13 @@ class SlurmTarget(BaseTarget):
         queue = await self._queue_state(handle)
         state = queue.state if queue is not None else None
         if queue is not None and queue.state:
-            await self._announce(job_id, *queue)
+            await self._announce(
+                job_id,
+                queue.state,
+                queue.reason,
+                queue.nodes,
+                await self._partition_summary(queue),
+            )
 
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
@@ -659,7 +710,7 @@ class SlurmTarget(BaseTarget):
         fail jobs that are still fine.
         """
         proc = await self.inner.run_command_sync(
-            f'squeue -h -j {self._handle_job_id(handle)} -o "%T|%R"'
+            f'squeue -h -j {self._handle_job_id(handle)} -o "%T|%R|%P"'
         )
         out, _err = await proc.communicate()
         if proc.returncode != 0:
@@ -669,11 +720,79 @@ class SlurmTarget(BaseTarget):
             return QueueState("")
         # A job array reports one line per element; the first is enough for a
         # single job, which is all this target submits.
-        state, _sep, where = text.splitlines()[0].strip().partition("|")
+        state, where, partition = [
+            *text.splitlines()[0].strip().split("|", 2),
+            "",
+            "",
+        ][:3]
         if where.startswith("(") and where.endswith(")"):
             reason = where[1:-1]
-            return QueueState(state, None if reason == "None" else reason)
-        return QueueState(state, nodes=where or None)
+            return QueueState(
+                state,
+                None if reason == "None" else reason,
+                partition=partition or None,
+            )
+        return QueueState(
+            state, nodes=where or None, partition=partition or None
+        )
+
+    async def _partition_summary(
+        self, queue: QueueState
+    ) -> dict[str, int] | None:
+        """
+        Node state -> count for the job's partition while it is pending on a
+        :data:`NODE_REASONS` reason, else ``None``.
+
+        Re-read when the reason changes, and otherwise at most every
+        :data:`PARTITION_SUMMARY_INTERVAL` seconds.
+        """
+        reason = queue.reason or ""
+        if queue.state != "PENDING" or not reason.startswith(NODE_REASONS):
+            self._partition_checked = None
+            self._partition_nodes = None
+            return None
+        now = time.monotonic()
+        if (
+            self._partition_checked is not None
+            and self._partition_checked[0] == reason
+            and now - self._partition_checked[1] < PARTITION_SUMMARY_INTERVAL
+        ):
+            return self._partition_nodes
+        self._partition_checked = (reason, now)
+        self._partition_nodes = await self._sinfo(
+            self.partition or queue.partition
+        )
+        return self._partition_nodes
+
+    async def _sinfo(self, partition: str | None) -> dict[str, int] | None:
+        """
+        ``sinfo``'s node counts per state for *partition*, with the trailing
+        state flags (``*`` not responding, ``~`` powered down, ...) stripped.
+        Best effort: any failure is ``None``, never a failed job.
+        """
+        if not partition:
+            return None
+        try:
+            proc = await self.inner.run_command_sync(
+                f'sinfo -h -p {shlex.quote(partition)} -o "%T|%D"'
+            )
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors="replace").strip())
+            counts: dict[str, int] = {}
+            for line in out.decode(errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                state, _sep, count = line.strip().partition("|")
+                state = state.rstrip("*~#!%$@^-").lower()
+                counts[state] = counts.get(state, 0) + int(count)
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not summarise partition %(partition)s: %(err)s")
+                % {"partition": partition, "err": exc}
+            )
+            return None
+        return counts
 
     async def _final_state(
         self, handle: JobHandle

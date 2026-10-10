@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: horus-slurm VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-10-10 18:36+0200\n"
+"POT-Creation-Date: 2026-10-10 18:39+0200\n"
 "PO-Revision-Date: 2026-06-10 23:42+0200\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: en\n"
@@ -29,51 +29,51 @@ msgstr "Could not read Slurm accounting: %(err)s"
 msgid "No Slurm job id for task %(task)s; no accounting read"
 msgstr "No Slurm job id for task %(task)s; no accounting read"
 
-#: src/horus_slurm/target/slurm.py:98
+#: src/horus_slurm/target/slurm.py:117
 msgid "Submit jobs to a Slurm cluster via sbatch"
 msgstr "Submit jobs to a Slurm cluster via sbatch"
 
-#: src/horus_slurm/target/slurm.py:265
+#: src/horus_slurm/target/slurm.py:293
 #, python-format
 msgid "sbatch submission failed: %(error)s"
 msgstr "sbatch submission failed: %(error)s"
 
-#: src/horus_slurm/target/slurm.py:315
+#: src/horus_slurm/target/slurm.py:343
 #, python-format
 msgid "Could not record job id for observation: %(err)s"
 msgstr "Could not record job id for observation: %(err)s"
 
-#: src/horus_slurm/target/slurm.py:341
+#: src/horus_slurm/target/slurm.py:384
 #, python-format
 msgid "Slurm job %(job_id)s is %(state)s (%(reason)s)"
 msgstr "Slurm job %(job_id)s is %(state)s (%(reason)s)"
 
-#: src/horus_slurm/target/slurm.py:347
+#: src/horus_slurm/target/slurm.py:390
 #, python-format
 msgid "Slurm job %(job_id)s is %(state)s"
 msgstr "Slurm job %(job_id)s is %(state)s"
 
-#: src/horus_slurm/target/slurm.py:364
+#: src/horus_slurm/target/slurm.py:408
 #, python-format
 msgid "Could not announce Slurm job state: %(err)s"
 msgstr "Could not announce Slurm job state: %(err)s"
 
-#: src/horus_slurm/target/slurm.py:382
+#: src/horus_slurm/target/slurm.py:426
 #, python-format
 msgid "Could not record Slurm job state: %(err)s"
 msgstr "Could not record Slurm job state: %(err)s"
 
-#: src/horus_slurm/target/slurm.py:462
+#: src/horus_slurm/target/slurm.py:512
 #, python-format
 msgid "The job vanished from queue without writing an exit code (%(state)s)."
 msgstr "The job vanished from queue without writing an exit code (%(state)s)."
 
-#: src/horus_slurm/target/slurm.py:490
+#: src/horus_slurm/target/slurm.py:540
 #, python-format
 msgid "Retrying exit_code fetch, attempt %(attempt)d/%(attempts)d..."
 msgstr "Retrying exit_code fetch, attempt %(attempt)d/%(attempts)d..."
 
-#: src/horus_slurm/target/slurm.py:570
+#: src/horus_slurm/target/slurm.py:620
 #, python-format
 msgid ""
 "Ignoring vram_gb=%(vram)s: Slurm has no portable flag for GPU memory. "
@@ -82,10 +82,15 @@ msgstr ""
 "Ignoring vram_gb=%(vram)s: Slurm has no portable flag for GPU memory. "
 "Express it in gres or extra_sbatch_args."
 
-#: src/horus_slurm/target/slurm.py:644
+#: src/horus_slurm/target/slurm.py:694
 #, python-format
 msgid "Could not read log %(path)s: %(error)s"
 msgstr "Could not read log %(path)s: %(error)s"
+
+#: src/horus_slurm/target/slurm.py:790
+#, python-format
+msgid "Could not summarise partition %(partition)s: %(err)s"
+msgstr "Could not summarise partition %(partition)s: %(err)s"
 
 #~ msgid "Slurm Target"
 #~ msgstr "Slurm Target"
