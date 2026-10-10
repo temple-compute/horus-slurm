@@ -23,7 +23,12 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.event.base import BaseEvent
 
 from horus_slurm.events import SlurmJobEvent
-from horus_slurm.record import RECORD_FILE, SlurmJobRecord
+from horus_slurm.record import (
+    RECORD_FILE,
+    STDERR_FILE,
+    STDOUT_FILE,
+    SlurmJobRecord,
+)
 from horus_slurm.resources import SlurmJobScope, resolve_resources
 from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
 
@@ -175,6 +180,53 @@ class TestSubmission:
         # The command runs *inside* the script, which is what puts the
         # resource monitor's injected sampler on the compute node.
         assert "( run me );" in script
+
+    async def test_a_bound_task_sends_its_output_to_side_artifacts(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The raw logs land where side artifacts are collected, and that
+        directory exists before sbatch: Slurm silently drops output whose
+        directory is missing.
+        """
+        task = _Task(str(tmp_path / "work"))
+        target = _target(inner)
+        _bind(target, task)
+        side = Path(task.side_artifacts_dir)
+        side_existed_at_sbatch: list[bool] = []
+        run = FakeInner.run_command_sync
+
+        async def spy(self: FakeInner, cmd: str, **kwargs: Any) -> Any:
+            if cmd.startswith("sbatch"):
+                side_existed_at_sbatch.append(side.is_dir())
+            return await run(self, cmd, **kwargs)
+
+        monkeypatch.setattr(FakeInner, "run_command_sync", spy)
+        job_dir = tmp_path / "job"
+
+        await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(job_dir)
+        )
+
+        script = (job_dir / "job.sh").read_text()
+        assert f"#SBATCH --output={side}/{STDOUT_FILE}" in script
+        assert f"#SBATCH --error={side}/{STDERR_FILE}" in script
+        assert f"{job_dir}/exit_code" in script
+        assert side_existed_at_sbatch == [True]
+        record = _read_record(task)
+        assert record.stdout_path == f"{side}/{STDOUT_FILE}"
+        assert record.stderr_path == f"{side}/{STDERR_FILE}"
+
+    def test_an_unbound_target_keeps_its_output_in_the_job_dir(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Without a task there is no side-artifacts dir to write to."""
+        script = _target(inner)._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        assert f"#SBATCH --output={tmp_path}/stdout.log" in script
+        assert f"#SBATCH --error={tmp_path}/stderr.log" in script
 
 
 @pytest.mark.unit
@@ -769,6 +821,21 @@ class TestOutputAndDelegation:
         handle = JobHandle(pid=None, job_dir=str(tmp_path))
 
         assert await _target(inner).read_output(handle) == (b"out", b"err")
+
+    async def test_a_bound_task_reads_its_side_artifact_logs(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Output is read from wherever the script sent it."""
+        task = _Task(str(tmp_path))
+        side = Path(task.side_artifacts_dir)
+        side.mkdir()
+        (side / STDOUT_FILE).write_text("out")
+        (side / STDERR_FILE).write_text("err")
+        target = _target(inner)
+        _bind(target, task)
+        handle = JobHandle(pid=None, job_dir=str(tmp_path / "job"))
+
+        assert await target.read_output(handle) == (b"out", b"err")
 
     async def test_missing_logs_are_empty_not_an_error(
         self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
