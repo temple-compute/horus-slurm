@@ -38,6 +38,7 @@ class StateChange(BaseModel):
 
     state: str
     at: datetime
+    reason: str | None = None
 
 
 class SlurmJobRecord(BaseModel):
@@ -64,15 +65,30 @@ class SlurmJobRecord(BaseModel):
         default_factory=dict
     )
     exit_code: int | None = None
+    reason: str | None = None
+    """Why the job is in its current state, from squeue/sacct; see events."""
+    nodes: str | None = None
+    """The node list the job is running on, while it runs."""
+    partition_nodes: dict[str, int] | None = None
+    """Node state -> count for the job's partition, while it waits on it."""
 
-    def with_state(self, state: str) -> SlurmJobRecord:
+    def with_state(
+        self,
+        state: str,
+        reason: str | None = None,
+        nodes: str | None = None,
+    ) -> SlurmJobRecord:
         """Return a copy with *state* appended to the history."""
         return self.model_copy(
             update={
                 "state": state,
+                "reason": reason,
+                "nodes": nodes,
                 "states": [
                     *self.states,
-                    StateChange(state=state, at=datetime.now(UTC)),
+                    StateChange(
+                        state=state, at=datetime.now(UTC), reason=reason
+                    ),
                 ],
             }
         )
