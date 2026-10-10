@@ -32,6 +32,15 @@ it to an artifact kind in ``tc_plugins.artifact_kind``) depends on this exact
 name -- keep the two in sync if it ever changes.
 """
 
+STDOUT_FILE = "slurm-stdout.log"
+"""
+Filename the job's raw Slurm stdout is written under, inside
+``task.side_artifacts_dir``, so it is collected next to :data:`RECORD_FILE`.
+"""
+
+STDERR_FILE = "slurm-stderr.log"
+"""Like :data:`STDOUT_FILE`, for the job's raw Slurm stderr."""
+
 
 class StateChange(BaseModel):
     """One entry in a job's state history."""

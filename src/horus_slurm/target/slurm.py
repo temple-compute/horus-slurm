@@ -40,7 +40,12 @@ from pydantic import Field
 
 from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
-from horus_slurm.record import RECORD_FILE, SlurmJobRecord
+from horus_slurm.record import (
+    RECORD_FILE,
+    STDERR_FILE,
+    STDOUT_FILE,
+    SlurmJobRecord,
+)
 from horus_slurm.resources import (
     SbatchResources,
     SlurmJobScope,
@@ -277,6 +282,10 @@ class SlurmTarget(BaseTarget):
         Build the SLURM script and launch the ``sbatch`` command.
         """
         await self.inner.mkdir(job_dir)
+        stdout_path, stderr_path = self._log_paths(job_dir)
+        # Slurm does not create a missing --output directory; it silently
+        # drops the output instead.
+        await self.inner.mkdir(str(Path(stdout_path).parent))
 
         script = self._build_sbatch_script(
             cmd, cwd=cwd, env=env, job_dir=job_dir
@@ -309,8 +318,8 @@ class SlurmTarget(BaseTarget):
             script_path=script_path,
             working_dir=target_cwd,
             job_dir=job_dir,
-            stdout_path=f"{job_dir}/stdout.log",
-            stderr_path=f"{job_dir}/stderr.log",
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
             sbatch=self._sbatch_summary(),
         )
         await self._announce(job_id, SUBMITTED)
@@ -566,9 +575,10 @@ class SlurmTarget(BaseTarget):
         ranged read (``tail -c +offset``) if job logs get large enough to
         matter.
         """
-        stdout = await self._read_log(f"{handle.job_dir}/stdout.log")
-        stderr = await self._read_log(f"{handle.job_dir}/stderr.log")
-        return stdout, stderr
+        stdout_path, stderr_path = self._log_paths(handle.job_dir)
+        return await self._read_log(stdout_path), await self._read_log(
+            stderr_path
+        )
 
     async def send_signal(self, handle: JobHandle, sig: int) -> None:
         """
@@ -631,6 +641,19 @@ class SlurmTarget(BaseTarget):
             gres=self.gres,
         )
 
+    def _log_paths(self, job_dir: str) -> tuple[str, str]:
+        """
+        Where the job's stdout and stderr go.
+
+        A bound task gets them in its side-artifacts dir, so the untouched
+        files are collected next to the job record; an unbound target keeps
+        them in *job_dir*.
+        """
+        if self._task is None:
+            return f"{job_dir}/stdout.log", f"{job_dir}/stderr.log"
+        side = self._task.side_artifacts_dir
+        return f"{side}/{STDOUT_FILE}", f"{side}/{STDERR_FILE}"
+
     def _build_sbatch_script(
         self,
         cmd: str,
@@ -643,8 +666,9 @@ class SlurmTarget(BaseTarget):
 
         lines = ["#!/bin/bash"]
         lines.append(f"#SBATCH --job-name=horus-{Path(job_dir).name}")
-        lines.append(f"#SBATCH --output={job_dir}/stdout.log")
-        lines.append(f"#SBATCH --error={job_dir}/stderr.log")
+        stdout_path, stderr_path = self._log_paths(job_dir)
+        lines.append(f"#SBATCH --output={stdout_path}")
+        lines.append(f"#SBATCH --error={stderr_path}")
         lines.append(f"#SBATCH --nodes={self.nodes}")
         lines.append(f"#SBATCH --ntasks={self.ntasks}")
         lines.append(f"#SBATCH --cpus-per-task={resolved.cpus_per_task}")
