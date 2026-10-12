@@ -29,7 +29,11 @@ from horus_slurm.record import (
     STDOUT_FILE,
     SlurmJobRecord,
 )
-from horus_slurm.resources import SlurmJobScope, resolve_resources
+from horus_slurm.resources import (
+    SlurmJobScope,
+    resolve_resources,
+    to_slurm_time,
+)
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import JOB_ID_FILE, QueueState, SlurmTarget
 
@@ -147,6 +151,57 @@ class TestSubmission:
                 "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
             )
 
+    async def test_a_rejected_time_limit_says_what_was_asked(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Slurm's "Requested time limit is invalid" names neither the limit nor
+        the partition, so the error adds both, plus the partition's MaxTime
+        when sinfo knows it. Here the job fell into the default partition.
+        """
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(
+                stderr=b"sbatch: error: Batch job submission failed: "
+                b"Requested time limit is invalid (missing or exceeds "
+                b"some limit)",
+                returncode=1,
+            ),
+            sinfo=FakeProcess(stdout=b"short* 2-00:00:00\nlong 10-00:00:00\n"),
+        )
+        with pytest.raises(TaskExecutionError) as raised:
+            await _target(inner, time_limit="10-00:00:00").launch(
+                "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+            )
+
+        message = str(raised.value)
+        assert "Requested time limit is invalid" in message
+        assert "--time=10-00:00:00" in message
+        assert "the default partition" in message
+        assert "MaxTime is 2-00:00:00" in message
+        assert inner.commands[-1] == "sinfo -h -o '%P %l'"
+
+    async def test_a_named_partition_is_looked_up_even_without_sinfo(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The partition asked for is named, and a failing sinfo costs only the
+        MaxTime: the error is never raised harder than before.
+        """
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(
+                stderr=b"Requested time limit is invalid", returncode=1
+            ),
+            sinfo=FakeProcess(stderr=b"slurm_load_partitions", returncode=1),
+        )
+        with pytest.raises(TaskExecutionError) as raised:
+            await _target(inner, partition="gpu", time_limit="2h").launch(
+                "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+            )
+
+        message = str(raised.value)
+        assert "requested --time=02:00:00 on partition gpu)" in message
+        assert "MaxTime" not in message
+
     def test_script_carries_the_sbatch_directives(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
@@ -242,6 +297,47 @@ class TestResolveResources:
             None,
             None,
             None,
+        )
+
+    @pytest.mark.parametrize(
+        ("walltime", "expected"),
+        [
+            ("30s", "00:00:30"),
+            ("90m", "01:30:00"),
+            ("2h", "02:00:00"),
+            ("1.5h", "01:30:00"),
+            ("36h", "1-12:00:00"),
+            ("1d", "1-00:00:00"),
+            ("2H", "02:00:00"),
+        ],
+    )
+    def test_suffixed_walltimes_become_slurm_syntax(
+        self, walltime: str, expected: str
+    ) -> None:
+        """
+        The suffixes ``resources.walltime`` documents are not sbatch's, so
+        they are rendered as ``[D-]HH:MM:SS`` wherever they come from.
+        """
+        assert to_slurm_time(walltime) == expected
+        assert (
+            resolve_resources(ResourceRequest(walltime=walltime)).time_limit
+            == expected
+        )
+        assert resolve_resources(None, time_limit=walltime).time_limit == (
+            expected
+        )
+
+    @pytest.mark.parametrize(
+        "walltime",
+        ["01:00:00", "1-12:00", "10-00:00:00", "90:00", "60", "soon", ""],
+    )
+    def test_slurm_syntax_passes_through_untouched(
+        self, walltime: str
+    ) -> None:
+        """What is already Slurm's, or unreadable, is Slurm's to judge."""
+        assert to_slurm_time(walltime) == walltime
+        assert resolve_resources(None, time_limit=walltime).time_limit == (
+            walltime
         )
 
     def test_a_request_supplies_every_directive(self) -> None:
