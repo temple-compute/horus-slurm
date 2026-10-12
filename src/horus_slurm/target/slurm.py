@@ -142,7 +142,13 @@ class SlurmTarget(BaseTarget):
     nodes: int = 1
     ntasks: int = 1
     cpus_per_task: int | None = None
-    mem: str | None = None
+    mem: str | None = Field(
+        default=None,
+        description=_(
+            "Memory per node with a unit, e.g. 4G. "
+            "A bare number is megabytes to Slurm."
+        ),
+    )
     time_limit: str | None = None  # e.g. "01:00:00"
     gres: str | None = None  # e.g. "gpu:1"
     extra_sbatch_args: list[str] = Field(default_factory=list)
@@ -298,9 +304,11 @@ class SlurmTarget(BaseTarget):
         )
         out, err = await proc.communicate()
         if proc.returncode != 0:
+            error = err.decode(errors="replace").strip()
+            if "time limit" in error.lower():
+                error += await self._time_limit_context()
             raise TaskExecutionError(
-                _("sbatch submission failed: %(error)s")
-                % {"error": err.decode(errors="replace").strip()}
+                _("sbatch submission failed: %(error)s") % {"error": error}
             )
 
         # --parsable prints "<jobid>" or "<jobid>;<cluster>" for federated
@@ -330,6 +338,61 @@ class SlurmTarget(BaseTarget):
             job_dir=job_dir,
             extra={"job_id": job_id, "raw_job_id": raw_id},
         )
+
+    async def _time_limit_context(self) -> str:
+        """
+        What was asked for when sbatch rejects the time limit, and the
+        partition's MaxTime when ``sinfo`` is willing to say.
+
+        Slurm's own message ("Requested time limit is invalid (missing or
+        exceeds some limit)") names neither, and the usual cause is a
+        ``time_limit`` beyond the MaxTime of the partition the job landed in
+        -- often the default one, when ``partition`` is unset. Best effort:
+        the error is only ever made more specific, never raised harder.
+        """
+        requested = self.resolved_resources().time_limit
+        where = (
+            _("partition %(partition)s") % {"partition": self.partition}
+            if self.partition
+            else _("the default partition")
+        )
+        context = _(" (requested --time=%(time)s on %(where)s") % {
+            "time": requested,
+            "where": where,
+        }
+        max_time = await self._partition_max_time()
+        if max_time:
+            context += _(", whose MaxTime is %(max_time)s") % {
+                "max_time": max_time
+            }
+        return context + ")"
+
+    async def _partition_max_time(self) -> str | None:
+        """
+        ``MaxTime`` of this target's partition (the cluster default when none
+        is set), or ``None`` when ``sinfo`` cannot say.
+        """
+        try:
+            proc = await self.inner.run_command_sync("sinfo -h -o '%P %l'")
+            out, _err = await proc.communicate()
+            if proc.returncode != 0:
+                return None
+            for line in out.decode(errors="replace").splitlines():
+                # "%P" marks the default partition with a trailing "*".
+                name, _sep, max_time = line.strip().partition(" ")
+                matches = (
+                    name.rstrip("*") == self.partition
+                    if self.partition
+                    else name.endswith("*")
+                )
+                if matches:
+                    return max_time or None
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not read the partition's MaxTime: %(err)s")
+                % {"err": exc}
+            )
+        return None
 
     @staticmethod
     def _job_id_path(task: BaseTask) -> str:

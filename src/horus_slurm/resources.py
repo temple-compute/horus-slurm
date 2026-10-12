@@ -19,6 +19,38 @@ What ``--cpus-per-task`` falls back to when neither the target nor the task
 says anything. Slurm's own default, made explicit.
 """
 
+_SUFFIX_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+"""Units of a suffixed duration such as ``"2h"`` or ``"90m"``."""
+
+
+def to_slurm_time(value: str | None) -> str | None:
+    """
+    Render a suffixed duration (``"30s"``, ``"90m"``, ``"2h"``, ``"1d"``) in
+    Slurm's ``[D-]HH:MM:SS`` syntax.
+
+    ``resources.walltime`` is documented as accepting those suffixes, but
+    sbatch does not, and passing ``"2h"`` through verbatim had it rejected
+    as an invalid time limit. Anything that is not a suffixed duration --
+    ``"01:00:00"``, ``"1-12:00"``, bare minutes, or something this cannot
+    read -- is already Slurm's to judge and passes through untouched.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    unit = _SUFFIX_SECONDS.get(text[-1:].lower())
+    if unit is None:
+        return value
+    try:
+        amount = float(text[:-1])
+    except ValueError:
+        return value
+    total = round(amount * unit)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}-{clock}" if days else clock
+
 
 @dataclass(frozen=True)
 class SlurmJobScope(ResourceScope):
@@ -69,7 +101,9 @@ def resolve_resources(
         request: The task's ``resources``, or ``None`` when it declared none.
         cpus_per_task: Explicit ``--cpus-per-task``, or ``None`` to derive it.
         mem: Explicit ``--mem``, or ``None`` to derive it.
-        time_limit: Explicit ``--time``, or ``None`` to derive it.
+        time_limit: Explicit ``--time``, or ``None`` to derive it. Either
+            source may use a suffixed duration (``"2h"``); see
+            :func:`to_slurm_time`.
         gres: Explicit ``--gres``, or ``None`` to derive it.
 
     Returns:
@@ -90,7 +124,7 @@ def resolve_resources(
                 else DEFAULT_CPUS_PER_TASK
             ),
             mem=mem,
-            time_limit=time_limit,
+            time_limit=to_slurm_time(time_limit),
             gres=gres,
         )
 
@@ -111,6 +145,6 @@ def resolve_resources(
             else DEFAULT_CPUS_PER_TASK
         ),
         mem=mem,
-        time_limit=time_limit,
+        time_limit=to_slurm_time(time_limit),
         gres=gres,
     )
