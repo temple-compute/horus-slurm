@@ -8,7 +8,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
 ]
 dependencies = [
-  "horus-runtime>=0.3.0",
+  "horus-runtime>=0.7.1",
 ]
 
 [project.entry-points."horus.resource_probe"]
