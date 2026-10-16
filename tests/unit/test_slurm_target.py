@@ -11,6 +11,7 @@ resource scope it declares.
 
 import json
 import signal as signal_mod
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -1283,6 +1284,28 @@ class TestOutputAndDelegation:
         await _target(inner).get_file_to("/remote/f", tmp_path / "f")
 
         assert calls == [("/remote/f", tmp_path / "f")]
+
+    async def test_read_range_delegates(
+        self, inner: FakeInner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """read_range goes to the transport unchanged."""
+        calls: list[tuple[str, int, int]] = []
+
+        async def read_range(
+            _self: FakeInner, remote_path: str, offset: int, length: int
+        ) -> AsyncIterator[bytes]:
+            calls.append((remote_path, offset, length))
+            yield b"ab"
+            yield b"c"
+
+        monkeypatch.setattr(FakeInner, "read_range", read_range, raising=False)
+
+        chunks = [
+            c async for c in _target(inner).read_range("/r/f", 1048576, 3)
+        ]
+
+        assert chunks == [b"ab", b"c"]
+        assert calls == [("/r/f", 1048576, 3)]
 
     async def test_control_plane_commands_bypass_the_scheduler(
         self, inner: FakeInner

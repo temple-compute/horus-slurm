@@ -53,6 +53,8 @@ from horus_slurm.resources import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from horus_runtime.core.artifact.base import BaseArtifact
     from horus_runtime.core.resources import ResourceScope
     from horus_runtime.core.task.base import BaseTask
@@ -257,6 +259,15 @@ class SlurmTarget(BaseTarget):
         Delegate to inner, so a streaming transport is not bypassed.
         """
         await self.inner.get_file_to(remote_path, local_path)
+
+    async def read_range(
+        self, remote_path: str, offset: int, length: int
+    ) -> AsyncIterator[bytes]:
+        """
+        Delegate to inner.
+        """
+        async for chunk in self.inner.read_range(remote_path, offset, length):
+            yield chunk
 
     async def mkdir(self, path: str) -> None:
         """
