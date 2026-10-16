@@ -1264,6 +1264,26 @@ class TestOutputAndDelegation:
         await target.remove(str(tmp_path / "d" / "f"))
         assert not await target.path_exists(str(tmp_path / "d" / "f"))
 
+    async def test_get_file_to_delegates(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        get_file_to goes to the transport, so an SSH inner can stream to
+        disk instead of loading the file through get_file.
+        """
+        calls: list[tuple[str, Path]] = []
+
+        async def get_file_to(
+            _self: FakeInner, remote_path: str, local_path: Path
+        ) -> None:
+            calls.append((remote_path, local_path))
+
+        monkeypatch.setattr(FakeInner, "get_file_to", get_file_to)
+
+        await _target(inner).get_file_to("/remote/f", tmp_path / "f")
+
+        assert calls == [("/remote/f", tmp_path / "f")]
+
     async def test_control_plane_commands_bypass_the_scheduler(
         self, inner: FakeInner
     ) -> None:

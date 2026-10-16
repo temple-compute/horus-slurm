@@ -252,6 +252,12 @@ class SlurmTarget(BaseTarget):
         """
         return await self.inner.get_file(remote_path)
 
+    async def get_file_to(self, remote_path: str, local_path: Path) -> None:
+        """
+        Delegate to inner, so a streaming transport is not bypassed.
+        """
+        await self.inner.get_file_to(remote_path, local_path)
+
     async def mkdir(self, path: str) -> None:
         """
         Delegate to inner.
