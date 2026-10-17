@@ -246,3 +246,7 @@ affects terraform boots.
 **Q3. Named-target Slurm queue dot (`TaskCard.tsx:969`) in this WP?**
 Recommended: yes, it is in WP4 already (UX doc): shared members otherwise
 read as `running` next to a `queued` badge.
+
+## User decisions
+
+- Approved 2026-10-17 with the recommended answers: Q1 no tc-os backend tests; Q2 queued only on bound members, accepted; Q3 SlurmStatusDot for shared members in WP4, yes.
