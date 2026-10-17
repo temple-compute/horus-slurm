@@ -258,3 +258,7 @@ Also the inherited `_last_state` / `_cancelling` from `idle_copy`
    design only serialises retries and never does worse than today.
    Recommended: no backoff in this PR; revisit if Team 4 sees rate
    limiting.
+
+## User decisions
+
+- The squeue refresh interval is a target field, not a module constant, so it can be set per target from the canvas: `queue_check_interval: float = Field(default=30.0, ge=5, le=600, title=_("Queue check interval"), description=_("Seconds between squeue checks of a shared allocation"))`. It shows up in the schema-driven target form with no frontend change, next to `exit_code_retries` and `exit_code_delay`. Default 30 s.
