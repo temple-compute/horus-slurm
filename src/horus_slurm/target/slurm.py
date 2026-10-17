@@ -38,7 +38,7 @@ from horus_runtime.core.target.channel import (
 )
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from horus_runtime.core.artifact.base import BaseArtifact
     from horus_runtime.core.resources import ResourceScope
     from horus_runtime.core.task.base import BaseTask
+    from pydantic import ValidationInfo
 
 JOB_ID_FILE = ".horus_slurm_job_id"
 """
@@ -150,8 +151,23 @@ while true; do
 done
 """
 
+CLEAN_INTERVAL_S = 86400
+"""Seconds before a process cleans the same allocation root again."""
+
+_ALLOC_NAME = re.compile(r"([a-z][a-z0-9_-]{0,62})\.[0-9a-f]{12}-[0-9]+")
+"""An allocation dir name, ``<ref>.<lease_key>-<generation>``."""
+
+_CLEANED: dict[tuple[str, str, str], float] = {}
+"""When this process last cleaned each (location, root, target ref)."""
+
 _JOB_ID = re.compile(r"\d+(_\d+)?")
 """A job id as sbatch prints it, before it goes into another command."""
+
+# sbatch splits #SBATCH lines on newlines and options on any whitespace, and
+# reads quotes, backslashes and an unquoted `#` too. Values and paths need
+# none of these; extra_sbatch_args may hold anything but a new line.
+_STRICT_BAD = re.compile(r"[\s#'\"\\\x00]")
+_LINE_BAD = re.compile(r"[\n\r\x00]")
 
 
 @dataclass(eq=False)
@@ -173,6 +189,9 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set by the run-end release so a step moving late cannot submit a
+    # pilot nobody cancels; the next run's first launch clears it.
+    closed: bool = False
     # One squeue reading shared by all copies, keyed by the job id it was
     # read for. Taken after `lock`, never before it.
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -286,6 +305,19 @@ class SlurmTarget(BaseTarget):
         ge=1,
         description=_("Tasks that run at once in a shared allocation"),
     )
+    alloc_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        title=_("Allocation folder retention (days)"),
+    )
+    # Stops a step bouncing between allocations that die before they start.
+    max_step_moves: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        title=_("Task moves to a new allocation"),
+    )
 
     # The allocation's files live on the cluster's shared filesystem, so a
     # released allocation loses no output. A node-local working_directory
@@ -341,6 +373,9 @@ class SlurmTarget(BaseTarget):
     accounting how it ended instead of waiting out the exit-code retries.
     """
 
+    _cancel_pending: bool = False
+    """Set when the cancel of a moved step failed; the next poll retries it."""
+
     _record: SlurmJobRecord | None = None
     """
     The job's durable record, rewritten on every state transition and exit
@@ -348,6 +383,37 @@ class SlurmTarget(BaseTarget):
     """
 
     _alloc: _Allocation = PrivateAttr(default_factory=_Allocation)
+
+    @field_validator(
+        "partition", "account", "qos", "mem", "time_limit", "gres"
+    )
+    @classmethod
+    def _one_sbatch_value(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """A value that stays one option on its ``#SBATCH`` line."""
+        # A stray space from a form must not stop a stored workflow loading.
+        value = value.strip() if value is not None else None
+        if value is not None and _STRICT_BAD.search(value):
+            raise ValueError(
+                _(
+                    "%(field)s may not contain whitespace, '#', quotes or "
+                    "backslashes."
+                )
+                % {"field": info.field_name}
+            )
+        return value
+
+    @field_validator("extra_sbatch_args")
+    @classmethod
+    def _one_sbatch_line(cls, value: list[str]) -> list[str]:
+        """Each argument stays on its own ``#SBATCH`` line."""
+        value = [arg.strip() for arg in value]
+        if any(_LINE_BAD.search(arg) for arg in value):
+            raise ValueError(
+                _("extra_sbatch_args may not contain line breaks.")
+            )
+        return value
 
     # --- placement identity -------------------------------------------------
 
@@ -468,10 +534,16 @@ class SlurmTarget(BaseTarget):
         script_path = f"{job_dir}/job.sh"
         extra: dict[str, str] = {}
         if self.releasable:
+            # The step writes its own logs, closed before exit_code: srun's
+            # --output is flushed by slurmstepd after the step, so poll could
+            # see the exit code before the output.
+            q = shlex.quote
+            logged = f"( {cmd} ) >>{q(stdout_path)} 2>>{q(stderr_path)}"
             script = "\n".join(
-                ["#!/bin/bash", *self._script_body(cmd, cwd, env, job_dir)]
+                ["#!/bin/bash", *self._script_body(logged, cwd, env, job_dir)]
             )
             step = f"horus-{Path(job_dir).name}"
+            self._alloc.closed = False
             job_id, alloc_dir = await self._submit_step(
                 step, f"{script}\n", job_dir
             )
@@ -653,6 +725,7 @@ class SlurmTarget(BaseTarget):
             if reason in ("run_end", "abort"):
                 # Registered per run; a re-run registers its own.
                 handle.ready_callbacks.clear()
+                handle.closed = True
 
     async def keepalive(self) -> None:
         """
@@ -690,13 +763,17 @@ class SlurmTarget(BaseTarget):
                 if queue is not None and queue.gone:
                     handle.job_id = None
             if handle.job_id is None:
+                if handle.closed:
+                    raise TaskExecutionError(
+                        _("The allocation was released for this run.")
+                    )
                 handle.generation += 1
                 handle.queue_job_id = handle.queue = None
                 handle._partition_checked = None  # noqa: SLF001
                 handle._partition_nodes = None  # noqa: SLF001
+                root = f"{self.resolved_working_directory}/{ALLOC_DIR}"
                 alloc_dir = (
-                    f"{self.resolved_working_directory}/{ALLOC_DIR}/"
-                    f"{self.lease_key}-{handle.generation}"
+                    f"{root}/{self._ref}.{self.lease_key}-{handle.generation}"
                 )
                 await self._make_private_dir(alloc_dir)
                 script_path = f"{alloc_dir}/pilot.sh"
@@ -721,6 +798,8 @@ class SlurmTarget(BaseTarget):
                         )
             finally:
                 done.set()
+            # After sbatch, so the pilot queues while this runs.
+            await self._clean_alloc_dirs(root, alloc_dir)
         await done.wait()
         return handle
 
@@ -749,6 +828,80 @@ class SlurmTarget(BaseTarget):
                     "dir": alloc_dir,
                     "err": err.decode(errors="replace").strip(),
                 }
+            )
+
+    async def _clean_alloc_dirs(self, root: str, keep: str) -> None:
+        """
+        Remove this target's allocation dirs under *root* idle for longer
+        than ``alloc_retention_days``, except *keep*, the newest, and any
+        whose pilot Slurm still lists.
+
+        Age is the heartbeat's, which keepalive touches, so a live
+        allocation of another run is never old. Other targets' dirs follow
+        their own retention. At most once a day per process; best effort,
+        never raises.
+        """
+        key = (self.location_id, root, str(self._ref))
+        last = _CLEANED.get(key)
+        if last is not None and time.monotonic() - last < CLEAN_INTERVAL_S:
+            return
+        _CLEANED[key] = time.monotonic()
+        q = shlex.quote
+        # Relative to the real dir, so later commands name entries in the
+        # dir that was listed, and a root starting with `-` is no option.
+        cd = f"cd -P -- {q(root)}"
+        try:
+            proc = await self.inner.run_command_sync(
+                f"{cd} && date +%s && find . -mindepth 2 -maxdepth 2 "
+                f"-type f -name heartbeat -printf '%T@ %h\\n'"
+            )
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                # One unreadable entry fails find; the rest still counts.
+                horus_logger.log.debug(err.decode(errors="replace").strip())
+            now, *lines = out.decode(errors="replace").splitlines()
+            # The cluster's clock, as for the heartbeat times.
+            cutoff = float(now) - self.alloc_retention_days * 86400
+            found: list[tuple[float, str]] = []
+            for line in lines:
+                mtime, _sep, path = line.partition(" ")
+                match = _ALLOC_NAME.fullmatch(path.removeprefix("./"))
+                if match is not None and match[1] == self._ref:
+                    found.append((float(mtime), match[0]))
+            kept = {max(found)[1], Path(keep).name} if found else set()
+            old = [n for m, n in found if m < cutoff and n not in kept]
+            if not old:
+                return
+            # A pilot outlives a dead orchestrator while a step runs.
+            proc = await self.inner.run_command_sync(
+                'squeue -h -u "$(id -un)" -o %o'
+            )
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors="replace").strip())
+            live = out.decode(errors="replace").split()
+            old = [
+                n
+                for n in old
+                if not any(c.endswith(f"/{n}/pilot.sh") for c in live)
+            ]
+            # In chunks, so a long backlog stays under the argument limit;
+            # one chunk that fails does not stop the rest.
+            errors = []
+            for i in range(0, len(old), 200):
+                names = " ".join(q(n) for n in old[i : i + 200])
+                proc = await self.inner.run_command_sync(
+                    f"{cd} && [ -O . ] && rm -rf -- {names}"
+                )
+                _out, err = await proc.communicate()
+                if proc.returncode != 0:
+                    errors.append(err.decode(errors="replace").strip())
+            if errors:
+                raise RuntimeError("\n".join(errors))
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not clean old allocation dirs in %(dir)s: %(err)s")
+                % {"dir": root, "err": exc}
             )
 
     def _pilot_script(self, alloc_dir: str) -> str:
@@ -780,6 +933,15 @@ class SlurmTarget(BaseTarget):
         not run.
         """
         handle = await self._allocation()
+        # Read once: a copy may resubmit while this one spools.
+        job_id, alloc_dir = str(handle.job_id), handle.alloc_dir
+        await self._spool_step(job_id, alloc_dir, step, script, job_dir)
+        return job_id, alloc_dir
+
+    async def _spool_step(
+        self, job_id: str, alloc_dir: str, step: str, script: str, job_dir: str
+    ) -> None:
+        """Write the step script and launcher into alloc_dir/spool."""
         request = self._task.resources if self._task is not None else None
         # The task's own request, not the target's (the allocation's) size.
         step_res = resolve_resources(request)
@@ -796,9 +958,8 @@ class SlurmTarget(BaseTarget):
                 mem = "0"
         # A step gets every GPU of the job unless it says otherwise.
         gres = step_res.gres or ("none" if self.gres else None)
-        stdout_path, stderr_path = self._log_paths(job_dir)
         q = shlex.quote
-        run = f"{handle.alloc_dir}/run/{step}"
+        run = f"{alloc_dir}/run/{step}"
         exit_path = q(f"{job_dir}/exit_code")
         cancel = q(f"{run}.cancel")
         srun = [
@@ -807,8 +968,6 @@ class SlurmTarget(BaseTarget):
             f"--cpus-per-task={step_res.cpus_per_task}",
             f"--mem={q(mem)}",
             *([f"--gres={q(gres)}"] if gres else []),
-            f"--output={q(stdout_path)}",
-            f"--error={q(stderr_path)}",
             f"bash {q(run + '.job')}",
         ]
         launcher = (
@@ -820,21 +979,34 @@ class SlurmTarget(BaseTarget):
             "  sleep 1\n"
             "done\n"
             "wait $p; code=$?\n"
+            # srun exits 1 or 137 when cancelled, never 143.
+            f"[ -e {cancel} ] && code=143\n"
             f"[ -e {exit_path} ] || echo $code > {exit_path}\n"
         )
         await self.inner.put_file(script.encode(), f"{run}.job")
-        spool = f"{handle.alloc_dir}/spool/{step}"
+        spool = f"{alloc_dir}/spool/{step}"
         await self.inner.put_file(launcher.encode(), f"{spool}.tmp")
         # Renamed whole, so the pilot never runs a half-written launcher.
         proc = await self.inner.run_command_sync(
             f"mv {q(spool + '.tmp')} {q(spool + '.sh')}"
         )
-        if await proc.wait() != 0:
+        if await proc.wait() == 0:
+            return
+        # Over SSH a failed mv may still have run: the step name is the
+        # key, so a launcher found spooled or claimed has landed.
+        try:
+            proc = await self.inner.run_command_sync(
+                f"[ -e {q(spool + '.sh')} ] || [ -e {q(run + '.sh')} ] "
+                f"|| {{ rm -f {q(spool + '.tmp')}; exit 1; }}"
+            )
+            landed = await proc.wait() == 0
+        except Exception:
+            landed = False
+        if not landed:
             raise TaskExecutionError(
                 _("Could not hand the task to allocation %(job_id)s.")
-                % {"job_id": handle.job_id}
+                % {"job_id": job_id}
             )
-        return str(handle.job_id), handle.alloc_dir
 
     async def _step_id(self, job_id: str, step: str) -> str | None:
         """The id (``<job>.<n>``) of the running step named *step*."""
@@ -1044,6 +1216,8 @@ class SlurmTarget(BaseTarget):
         """
         exit_code_path = f"{handle.job_dir}/exit_code"
         job_id = self._handle_job_id(handle)
+        if self._cancel_pending:
+            await self._cancel_moved(handle)
 
         # Announce before the exit_code short-circuit: a job that finishes
         # between two polls would otherwise never report having run.
@@ -1064,6 +1238,10 @@ class SlurmTarget(BaseTarget):
             await self._record_exit_code(exit_code)
             return exit_code
 
+        if gone and not self._cancelling and await self._requeue_step(handle):
+            return None
+
+        # Also when a cancel came in during a move that then failed.
         if gone and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
@@ -1101,6 +1279,100 @@ class SlurmTarget(BaseTarget):
             return 1
 
         return None
+
+    async def _requeue_step(self, handle: JobHandle) -> bool:
+        """
+        Move a step its ended allocation never started into a live one.
+
+        True when moved: *handle* now points at the new allocation. False
+        when the caller should fail it as before (claimed, cancelled, out
+        of moves, inline target, or the move failed). Never raises.
+        """
+        extra = handle.extra or {}
+        step = extra.get("step")
+        moves = int(extra.get("moves", "0"))
+        if (
+            step is None
+            or self._cancelling
+            or self._record is None
+            or moves >= self.max_step_moves
+        ):
+            return False
+        q = shlex.quote
+        old = extra["alloc_dir"]
+        try:
+            # No -f: only a launcher the pilot never claimed is ours to move.
+            proc = await self.inner.run_command_sync(
+                f"rm {q(f'{old}/spool/{step}.sh')}"
+            )
+            if await proc.wait() != 0:
+                return False
+            alloc = await self._allocation()
+        except Exception as exc:
+            # Taken back or not, the step then fails as before.
+            horus_logger.log.error(
+                _("Could not move task step %(step)s: %(err)s")
+                % {"step": step, "err": exc}
+            )
+            return False
+        job_id, alloc_dir = str(alloc.job_id), alloc.alloc_dir
+        try:
+            # Rebuilt, not moved: the old one points at the old dir.
+            await self._spool_step(
+                job_id, alloc_dir, step, self._record.script, handle.job_dir
+            )
+        except Exception as exc:
+            horus_logger.log.error(
+                _("Could not move task step %(step)s: %(err)s")
+                % {"step": step, "err": exc}
+            )
+            # The launcher may have landed anyway: take it back, or keep
+            # watching it if the pilot has claimed it.
+            try:
+                proc = await self.inner.run_command_sync(
+                    f"! rm {q(f'{alloc_dir}/spool/{step}.sh')} 2>/dev/null "
+                    f"&& [ -e {q(f'{alloc_dir}/run/{step}.sh')} ]"
+                )
+                claimed = await proc.wait() == 0
+            except Exception:
+                # Unknown: watching beats a launcher nobody waits for.
+                claimed = True
+            if not claimed:
+                return False
+        extra |= {
+            "job_id": job_id,
+            "raw_job_id": job_id,
+            "alloc_dir": alloc_dir,
+            "moves": str(moves + 1),
+        }
+        self._record = self._record.model_copy(
+            update={
+                "job_id": job_id,
+                "script_path": f"{alloc_dir}/run/{step}.job",
+            }
+        )
+        await self._publish_job_id(job_id, cwd=self._record.working_dir)
+        self._last_state = None
+        await self._announce(job_id, SUBMITTED)
+        if self._cancelling:
+            # Cancelled mid-move: the signal went to the old dir.
+            await self._cancel_moved(handle)
+        return True
+
+    async def _cancel_moved(self, handle: JobHandle) -> None:
+        """Cancel a moved step; a failure is retried by the next poll."""
+        extra = handle.extra or {}
+        try:
+            await self._signal_step(
+                handle, extra["job_id"], extra["step"], signal.SIGTERM
+            )
+        except Exception as exc:
+            self._cancel_pending = True
+            horus_logger.log.debug(
+                _("Could not cancel the moved step: %(err)s") % {"err": exc}
+            )
+        else:
+            self._cancel_pending = False
 
     async def _record_exit_code(self, exit_code: int) -> None:
         """Persist the job's exit code on its record. Best effort."""
@@ -1293,6 +1565,37 @@ class SlurmTarget(BaseTarget):
         resolved: SbatchResources,
     ) -> list[str]:
         """The shebang and ``#SBATCH`` lines of a batch script."""
+        # Checked here too: the validators run on load, not on assignment.
+        for option, value in (
+            ("--job-name", job_name),
+            ("--output", stdout_path),
+            ("--error", stderr_path),
+            ("--partition", self.partition),
+            ("--account", self.account),
+            ("--qos", self.qos),
+            ("--mem", resolved.mem),
+            ("--time", resolved.time_limit),
+            ("--gres", resolved.gres),
+        ):
+            if value and _STRICT_BAD.search(value):
+                raise TaskExecutionError(
+                    _(
+                        "Invalid value for %(option)s: %(value)r may not "
+                        "contain whitespace, '#', quotes or backslashes."
+                    )
+                    % {"option": option, "value": value}
+                    + (
+                        _(" Check the working directory and the task id.")
+                        if option in ("--output", "--error")
+                        else ""
+                    )
+                )
+        for arg in self.extra_sbatch_args:
+            if _LINE_BAD.search(arg):
+                raise TaskExecutionError(
+                    _("Invalid extra sbatch argument %(arg)r: a line break.")
+                    % {"arg": arg}
+                )
         lines = ["#!/bin/bash"]
         lines.append(f"#SBATCH --job-name={job_name}")
         lines.append(f"#SBATCH --output={stdout_path}")

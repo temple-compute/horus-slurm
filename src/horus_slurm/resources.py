@@ -39,11 +39,11 @@ def to_slurm_time(value: str | None) -> str | None:
     text = value.strip()
     unit = _SUFFIX_SECONDS.get(text[-1:].lower())
     if unit is None:
-        return value
+        return text
     try:
         amount = float(text[:-1])
     except ValueError:
-        return value
+        return text
     total = round(amount * unit)
     days, rest = divmod(total, 86400)
     hours, rest = divmod(rest, 3600)
