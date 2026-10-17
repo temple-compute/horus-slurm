@@ -330,6 +330,16 @@ class TestHeaderInjection:
         assert again.gres == "gpu:a100:1"
         assert again.extra_sbatch_args == target.extra_sbatch_args
 
+    def test_outer_whitespace_is_dropped(self, inner: FakeInner) -> None:
+        """A stray space from a form does not stop the target loading."""
+        target = _target(
+            inner, partition=" gpu ", mem="4G\n", extra_sbatch_args=["--x "]
+        )
+        assert target.partition == "gpu"
+        assert target.mem == "4G"
+        assert target.extra_sbatch_args == ["--x"]
+        assert to_slurm_time("01:00:00 ") == "01:00:00"
+
     @pytest.mark.parametrize(
         "walltime", ["1:00:00\n#SBATCH --x", "1:00:00 --x"]
     )

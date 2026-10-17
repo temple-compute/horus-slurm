@@ -321,6 +321,8 @@ class SlurmTarget(BaseTarget):
         cls, value: str | None, info: ValidationInfo
     ) -> str | None:
         """A value that stays one option on its ``#SBATCH`` line."""
+        # A stray space from a form must not stop a stored workflow loading.
+        value = value.strip() if value is not None else None
         if value is not None and _STRICT_BAD.search(value):
             raise ValueError(
                 _(
@@ -335,6 +337,7 @@ class SlurmTarget(BaseTarget):
     @classmethod
     def _one_sbatch_line(cls, value: list[str]) -> list[str]:
         """Each argument stays on its own ``#SBATCH`` line."""
+        value = [arg.strip() for arg in value]
         if any(_LINE_BAD.search(arg) for arg in value):
             raise ValueError(
                 _("extra_sbatch_args may not contain line breaks.")
