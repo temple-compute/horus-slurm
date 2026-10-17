@@ -1321,7 +1321,8 @@ class TestAllocationEvents:
     ) -> None:
         """The run-end release after it sends nothing more."""
         inner.responds(squeue=RUNNING)
-        target = _shared(inner, exit_code_retries=0)
+        # Spooled steps would move on; this is about the gone allocation.
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
         (a, ha), (b, hb) = await _members(target, tmp_path, 2)
         inner.responds(squeue=GONE)
         _expire(target)
