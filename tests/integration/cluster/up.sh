@@ -10,15 +10,25 @@ project=${ITEST_PROJECT:-horus-slurm-itest}
 compose=(docker compose -p "$project" -f "$(dirname "$0")/compose.yaml")
 uid=$(id -u)
 
-# Before compose, or docker creates it owned by root.
+case "$ITEST_DIR" in
+    / | "$HOME" | "$HOME"/) echo "ITEST_DIR=$ITEST_DIR is too broad" >&2; exit 1 ;;
+esac
+# Before compose, or docker creates it owned by root. The pilot runs
+# launchers found below it, so nobody else may own or swap it.
 mkdir -p "$ITEST_DIR"
+if [ ! -O "$ITEST_DIR" ] || [ -L "$ITEST_DIR" ]; then
+    echo "ITEST_DIR=$ITEST_DIR must be a directory we own" >&2
+    exit 1
+fi
+chmod 700 "$ITEST_DIR"
 "${compose[@]}" up -d --no-build
 
 # Jobs run as the host uid so files on the bind mount stay ours.
 # Containers lose the user on recreate, so check every time.
 for svc in slurmctld c1 c2; do
     "${compose[@]}" exec -T "$svc" bash -c \
-        "getent passwd $uid >/dev/null || useradd -u $uid -M -d '$ITEST_DIR' itest"
+        'getent passwd "$1" >/dev/null || useradd -u "$1" -M -d "$2" itest' \
+        _ "$uid" "$ITEST_DIR"
 done
 
 while (( SECONDS < 120 )); do

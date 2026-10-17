@@ -49,11 +49,12 @@ test:
 	PYTHONPATH=. $(PYTEST_CMD)
 
 integration:
-	ITEST_DIR=$(ITEST_DIR) ITEST_PROJECT=$(ITEST_PROJECT) tests/integration/cluster/up.sh
-	ITEST_DIR=$(ITEST_DIR) HORUS_SLURM_ITEST=1 HORUS_SLURM_ITEST_LOGIN=$(ITEST_PROJECT)-slurmctld-1 PYTHONPATH=. $(INTEGRATION_CMD)
+	ITEST_DIR="$(ITEST_DIR)" ITEST_PROJECT="$(ITEST_PROJECT)" tests/integration/cluster/up.sh
+	ITEST_DIR="$(ITEST_DIR)" HORUS_SLURM_ITEST=1 HORUS_SLURM_ITEST_LOGIN="$(ITEST_PROJECT)-slurmctld-1" PYTHONPATH=. $(INTEGRATION_CMD)
 
 integration-down:
-	ITEST_DIR=$(ITEST_DIR) docker compose -p $(ITEST_PROJECT) -f tests/integration/cluster/compose.yaml down -v -t 2
+	ITEST_DIR="$(ITEST_DIR)" docker compose -p "$(ITEST_PROJECT)" -f tests/integration/cluster/compose.yaml down -v -t 2
+	rm -rf "$(ITEST_DIR)"/test_*-*
 
 # Individual check commands
 ruff-check:
