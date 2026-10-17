@@ -606,10 +606,6 @@ class TestScripts:
         subprocess.run(["bash", "-c", pilot], check=True, env=env, timeout=20)
         assert self._exit_code(tmp_path) == "0"
         assert list((alloc / "run").glob("*.sh"))
-        # Spooled after the pilot ended: never claimed, so it can be moved.
-        late = alloc / "spool" / "late.sh"
-        late.write_text("true\n")
-        assert late.exists()
 
 
 @pytest.mark.unit
