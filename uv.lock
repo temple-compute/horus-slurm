@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "horus-runtime"
-version = "0.7.1"
+version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -184,9 +184,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/55/35/0f48dd3729981ba92eb79df679ecd07a62a4bc2b5fd239700ddb07246415/horus_runtime-0.7.1.tar.gz", hash = "sha256:42011feab9304cedd6f8df6b29c84fa7993e52f79de4f34909682121b153a8e7", size = 350163, upload-time = "2026-10-16T17:55:27.808Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/a5/a25671394bf5f3f062878f1b285ad9842fa86306bc4f264e89bb5daffd43/horus_runtime-0.7.2.tar.gz", hash = "sha256:599dfb882dff81c31e3dedbd6c61e3caeeec24b4a076945acfd930ec5282bfa8", size = 350423, upload-time = "2026-10-17T12:06:39.664Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/4a/66f83e9614a2e1f2e50c0c5f37f9216f29ce7ef969682bcc8c7bdb7f2aa3/horus_runtime-0.7.1-py3-none-any.whl", hash = "sha256:9480346f945e7ed7baf01b08615e91ef6c3c6bc3a86b74a1011d6cfbe92c5e7a", size = 319669, upload-time = "2026-10-16T17:55:26.382Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/a5/010ff652843ac368e5a5e66622fbd6c09d9184bf0011fdc8e3555dc4eb98/horus_runtime-0.7.2-py3-none-any.whl", hash = "sha256:b6e73284bc8cab2b8a74bba4548ca9f6177c3f5c967bbe5fa674f0185c2f1466", size = 319789, upload-time = "2026-10-17T12:06:37.902Z" },
 ]
 
 [[package]]
@@ -219,7 +219,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "horus-resource-monitor", marker = "extra == 'resource-monitor'", git = "https://github.com/temple-compute/horus-resource-monitor" },
-    { name = "horus-runtime", specifier = ">=0.7.1" },
+    { name = "horus-runtime", specifier = ">=0.7.2" },
 ]
 provides-extras = ["resource-monitor"]
 

@@ -19,16 +19,7 @@ from horus_slurm.target.slurm import SlurmTarget
 from .conftest import _launch, job_state, poll_until, sh, steps, wait_for
 
 
-class _F1Error(AssertionError):
-    """The exit code a cancelled step reports is not 143 yet."""
-
-
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    raises=_F1Error,
-    reason="F1: srun exits 1 when cancelled pending, the launcher records it",
-)
 async def test_cancel_step_waiting_for_resources(
     shared_target: Callable[..., SlurmTarget], itest_dir: Path
 ) -> None:
@@ -71,8 +62,7 @@ async def test_cancel_step_waiting_for_resources(
     (d / "go").touch()
     assert await poll_until(target, a, 30) == 0
 
-    if code != 143:
-        raise _F1Error(f"poll returned {code}")
+    assert code == 143
 
 
 @pytest.mark.integration
