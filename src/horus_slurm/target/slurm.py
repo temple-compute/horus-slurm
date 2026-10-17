@@ -861,6 +861,8 @@ class SlurmTarget(BaseTarget):
             "  sleep 1\n"
             "done\n"
             "wait $p; code=$?\n"
+            # srun exits 1 or 137 when cancelled, never 143.
+            f"[ -e {cancel} ] && code=143\n"
             f"[ -e {exit_path} ] || echo $code > {exit_path}\n"
         )
         await self.inner.put_file(script.encode(), f"{run}.job")

@@ -506,7 +506,8 @@ class TestScripts:
     ) -> None:
         """The launcher watches the mark while srun waits or runs."""
         target, handle, launcher = await self._launched(inner, tmp_path)
-        env = self._bin(tmp_path, "trap 'exit 143' TERM; sleep 30 & wait")
+        # As real srun does: 137 for a running step, 1 for a pending one.
+        env = self._bin(tmp_path, "trap 'exit 137' TERM; sleep 30 & wait")
         # Claimed, as the pilot would, so the cancel cannot take it back.
         claimed = launcher.parent.parent / "run" / launcher.name
         launcher.rename(claimed)
