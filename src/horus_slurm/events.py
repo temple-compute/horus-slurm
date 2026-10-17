@@ -20,6 +20,8 @@ transition, not one per poll. Consumers that persist events (tc-os writes a row
 per event) get a handful per job.
 """
 
+from typing import Literal
+
 from horus_runtime.event.base import BaseEvent
 
 SUBMITTED = "SUBMITTED"
@@ -69,4 +71,46 @@ class SlurmJobEvent(BaseEvent):
     """
     Node state -> count for the job's partition (``{"idle": 0, "drained":
     2}``), only while it is pending on a resource or node reason.
+    """
+
+
+AllocationPhase = Literal[
+    "queued",
+    "failed",
+    "ready",
+    "busy",
+    "holding",
+    "draining",
+    "drain_failed",
+    "released",
+]
+"""
+Phases of a shared allocation: ``queued``, ``failed``, ``ready`` and
+``released`` from the target, the rest passed on from the lease manager.
+"""
+
+
+class SlurmAllocationEvent(BaseEvent):
+    """
+    The shared allocation behind a named target changed phase.
+
+    Shaped like a terraform node event (``node_key``, ``phase``) so a host
+    shows the allocation the way it shows a provisioned machine.
+    """
+
+    event_type: str = "slurm_allocation_event"
+    phase: AllocationPhase
+    task_id: str
+    """The task of the copy that sent it; ``""`` without one."""
+    node_key: str
+    """The target's lease key, the same for all its copies."""
+    target_ref: str | None
+    generation: int
+    member_task_ids: list[str]
+    """Tasks bound to this generation of the allocation."""
+    job_id: str | None = None
+    reason: str | None = None
+    """
+    For ``released``: ``done``, ``drained``, ``idle_cap``, ``run_end``,
+    ``abort`` or ``gone``. For ``failed``: the error.
     """

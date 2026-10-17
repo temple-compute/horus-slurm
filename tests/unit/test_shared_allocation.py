@@ -21,7 +21,9 @@ import pytest
 from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
+from pydantic import ValidationError
 
+from horus_slurm.events import SlurmAllocationEvent
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
@@ -424,3 +426,57 @@ class TestValidation:
         target = _shared(inner, mem="0")
         task = _Task(str(tmp_path), ResourceRequest(memory_gb=64))
         assert target.validate_member(task) == []  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+class TestAllocationEventModel:
+    """The wire shape a host reads, like a terraform node event."""
+
+    def test_round_trip(self) -> None:
+        """Every field a host reads is in the dump."""
+        event = SlurmAllocationEvent(
+            phase="queued",
+            task_id="a",
+            node_key="k",
+            target_ref="hpc",
+            generation=1,
+            member_task_ids=["a"],
+            job_id="12345",
+        )
+        data = event.model_dump(mode="json")
+        assert data["event_type"] == "slurm_allocation_event"
+        assert {
+            k: data[k]
+            for k in (
+                "phase",
+                "task_id",
+                "node_key",
+                "target_ref",
+                "generation",
+                "member_task_ids",
+                "job_id",
+                "reason",
+            )
+        } == {
+            "phase": "queued",
+            "task_id": "a",
+            "node_key": "k",
+            "target_ref": "hpc",
+            "generation": 1,
+            "member_task_ids": ["a"],
+            "job_id": "12345",
+            "reason": None,
+        }
+        assert SlurmAllocationEvent.model_validate(data) == event
+
+    def test_an_unknown_phase_is_refused(self) -> None:
+        """A phase the host does not know never leaves the target."""
+        with pytest.raises(ValidationError):
+            SlurmAllocationEvent(
+                phase="releasing",  # type: ignore[arg-type]
+                task_id="",
+                node_key="k",
+                target_ref="hpc",
+                generation=1,
+                member_task_ids=[],
+            )
