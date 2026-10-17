@@ -129,6 +129,12 @@ while true; do
 done
 """
 
+_ALLOC_NAME = re.compile(r"([a-z][a-z0-9_-]{0,62})\.[0-9a-f]{12}-[0-9]+")
+"""An allocation dir name, ``<ref>.<lease_key>-<generation>``."""
+
+_CLEANED_ROOTS: set[str] = set()
+"""Allocation roots already cleaned by this process."""
+
 _JOB_ID = re.compile(r"\d+(_\d+)?")
 """A job id as sbatch prints it, before it goes into another command."""
 
@@ -249,6 +255,12 @@ class SlurmTarget(BaseTarget):
         default=None,
         ge=1,
         description=_("Tasks that run at once in a shared allocation"),
+    )
+    alloc_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        title=_("Allocation folder retention (days)"),
     )
 
     # The allocation's files live on the cluster's shared filesystem, so a
@@ -666,11 +678,12 @@ class SlurmTarget(BaseTarget):
                     handle.job_id = None
             if handle.job_id is None:
                 handle.generation += 1
+                root = f"{self.resolved_working_directory}/{ALLOC_DIR}"
                 alloc_dir = (
-                    f"{self.resolved_working_directory}/{ALLOC_DIR}/"
-                    f"{self.lease_key}-{handle.generation}"
+                    f"{root}/{self._ref}.{self.lease_key}-{handle.generation}"
                 )
                 await self._make_private_dir(alloc_dir)
+                await self._clean_alloc_dirs(root, alloc_dir)
                 script_path = f"{alloc_dir}/pilot.sh"
                 await self.inner.put_file(
                     self._pilot_script(alloc_dir).encode(), script_path
@@ -721,6 +734,55 @@ class SlurmTarget(BaseTarget):
                     "dir": alloc_dir,
                     "err": err.decode(errors="replace").strip(),
                 }
+            )
+
+    async def _clean_alloc_dirs(self, root: str, keep: str) -> None:
+        """
+        Remove allocation dirs under *root* idle for longer than
+        ``alloc_retention_days``, except *keep* and each target's newest.
+
+        Age is the heartbeat's, which keepalive touches, so a live
+        allocation of another run is never old. Once per process per root;
+        best effort, never raises.
+        """
+        if root in _CLEANED_ROOTS:
+            return
+        _CLEANED_ROOTS.add(root)
+        q = shlex.quote
+        try:
+            proc = await self.inner.run_command_sync(
+                f"find {q(root)} -mindepth 2 -maxdepth 2 -type f "
+                f"-name heartbeat -printf '%T@ %h\\n'"
+            )
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors="replace").strip())
+            cutoff = time.time() - self.alloc_retention_days * 86400
+            newest: dict[str, tuple[float, str]] = {}
+            found: list[tuple[float, str]] = []
+            for line in out.decode(errors="replace").splitlines():
+                mtime, _sep, path = line.partition(" ")
+                parent, _sep, name = path.rpartition("/")
+                match = _ALLOC_NAME.fullmatch(name)
+                if parent != root or match is None:
+                    continue
+                entry = (float(mtime), path)
+                found.append(entry)
+                newest[match[1]] = max(newest.get(match[1], entry), entry)
+            kept = {path for _mtime, path in newest.values()} | {keep}
+            old = [p for m, p in found if m < cutoff and p not in kept]
+            if not old:
+                return
+            proc = await self.inner.run_command_sync(
+                "rm -rf " + " ".join(q(p) for p in old)
+            )
+            _out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors="replace").strip())
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not clean old allocation dirs in %(dir)s: %(err)s")
+                % {"dir": root, "err": exc}
             )
 
     def _pilot_script(self, alloc_dir: str) -> str:

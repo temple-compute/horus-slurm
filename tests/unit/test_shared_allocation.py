@@ -175,7 +175,7 @@ class TestAllocation:
     ) -> None:
         """Somebody else's directory is never used as the spool."""
         target = _shared(inner)
-        planted = tmp_path / ALLOC_DIR / f"{target.lease_key}-1"
+        planted = tmp_path / ALLOC_DIR / f"hpc.{target.lease_key}-1"
         planted.mkdir(parents=True)
         with pytest.raises(TaskExecutionError, match="allocation directory"):
             await _launch(target, tmp_path, "a")
@@ -372,6 +372,93 @@ class TestAllocation:
         assert inner.commands_starting("scancel") == [
             "scancel --signal=USR1 12345.1"
         ]
+
+
+def _idle_dir(tmp_path: Path, name: str, days: float) -> Path:
+    """An allocation dir whose heartbeat was last touched *days* ago."""
+    alloc = tmp_path / ALLOC_DIR / name
+    alloc.mkdir(parents=True)
+    (alloc / "heartbeat").touch()
+    old = time.time() - days * 86400
+    os.utime(alloc / "heartbeat", (old, old))
+    return alloc
+
+
+@pytest.mark.unit
+class TestCleanup:
+    """Old allocation dirs are removed when a new allocation starts."""
+
+    async def test_old_dirs_go_and_each_targets_newest_stays(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Grouped by target, aged by heartbeat; others are not touched."""
+        inner.runs("find ")
+        gone = [
+            _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30),
+            _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-2", 10),
+            _idle_dir(tmp_path, "gpu.cccccccccccc-1", 40),
+        ]
+        kept = [
+            _idle_dir(tmp_path, "hpc.bbbbbbbbbbbb-1", 1),
+            _idle_dir(tmp_path, "gpu.cccccccccccc-2", 30),
+            _idle_dir(tmp_path, "aaaaaaaaaaaa-1", 30),
+        ]
+        elsewhere = _idle_dir(tmp_path / "other", "hpc.dddddddddddd-1", 30)
+        link = tmp_path / ALLOC_DIR / "hpc.dddddddddddd-1"
+        link.symlink_to(elsewhere)
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+
+        current = tmp_path / ALLOC_DIR / f"hpc.{target.lease_key}-1"
+        assert set(_alloc_dirs(tmp_path)) == {*kept, link, current}
+        assert not any(p.exists() for p in gone)
+        assert (elsewhere / "heartbeat").exists()
+
+    async def test_retention_is_the_targets(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A longer retention keeps what the default would remove."""
+        inner.runs("find ")
+        old = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30)
+        await _launch(_shared(inner, alloc_retention_days=60), tmp_path, "a")
+        assert old.exists()
+
+    async def test_a_failed_find_is_ignored(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Cleanup never fails the allocation."""
+        inner.responds(find=FakeProcess(returncode=1))
+        await _launch(_shared(inner), tmp_path, "a")
+        assert inner.commands_starting("find ")
+        assert len(inner.commands_starting("sbatch")) == 1
+
+    async def test_a_failed_rm_is_ignored(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Nor does a dir it cannot remove."""
+        inner.runs("find ")
+        stuck = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30) / "x"
+        stuck.mkdir()
+        (stuck / "f").touch()
+        stuck.chmod(0o500)
+        try:
+            await _launch(_shared(inner), tmp_path, "a")
+        finally:
+            stuck.chmod(0o700)
+        assert inner.commands_starting("rm -rf") and stuck.exists()
+        assert len(inner.commands_starting("sbatch")) == 1
+
+    async def test_cleanup_runs_once_per_process(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A later allocation in the same working dir does not look again."""
+        inner.runs("find ")
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await target.release("idle_cap")
+        await _launch(target, tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 2
+        assert len(inner.commands_starting("find ")) == 1
 
 
 @pytest.mark.unit
