@@ -38,7 +38,7 @@ from horus_runtime.core.target.channel import (
 )
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
 from horus_slurm.i18n import tr as _
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from horus_runtime.core.artifact.base import BaseArtifact
     from horus_runtime.core.resources import ResourceScope
     from horus_runtime.core.task.base import BaseTask
+    from pydantic import ValidationInfo
 
 JOB_ID_FILE = ".horus_slurm_job_id"
 """
@@ -130,6 +131,12 @@ done
 
 _JOB_ID = re.compile(r"\d+(_\d+)?")
 """A job id as sbatch prints it, before it goes into another command."""
+
+# sbatch splits #SBATCH lines on newlines and options on any whitespace, and
+# reads quotes, backslashes and an unquoted `#` too. Structured values need
+# none of these; free-form ones may hold anything but a new line.
+_STRICT_BAD = re.compile(r"[\s#'\"\\\x00]")
+_LINE_BAD = re.compile(r"[\n\r\x00]")
 
 
 @dataclass(eq=False)
@@ -293,6 +300,34 @@ class SlurmTarget(BaseTarget):
     """
 
     _alloc: _Allocation = PrivateAttr(default_factory=_Allocation)
+
+    @field_validator(
+        "partition", "account", "qos", "mem", "time_limit", "gres"
+    )
+    @classmethod
+    def _one_sbatch_value(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """A value that stays one option on its ``#SBATCH`` line."""
+        if value is not None and _STRICT_BAD.search(value):
+            raise ValueError(
+                _(
+                    "%(field)s may not contain whitespace, '#', quotes or "
+                    "backslashes."
+                )
+                % {"field": info.field_name}
+            )
+        return value
+
+    @field_validator("extra_sbatch_args")
+    @classmethod
+    def _one_sbatch_line(cls, value: list[str]) -> list[str]:
+        """Each argument stays on its own ``#SBATCH`` line."""
+        if any(_LINE_BAD.search(arg) for arg in value):
+            raise ValueError(
+                _("extra_sbatch_args may not contain line breaks.")
+            )
+        return value
 
     # --- placement identity -------------------------------------------------
 
@@ -1228,6 +1263,21 @@ class SlurmTarget(BaseTarget):
         resolved: SbatchResources,
     ) -> list[str]:
         """The shebang and ``#SBATCH`` lines of a batch script."""
+        # Target fields are validated on load; these come from the task
+        # and its paths.
+        for option, value, bad in (
+            ("--job-name", job_name, _LINE_BAD),
+            ("--output", stdout_path, _LINE_BAD),
+            ("--error", stderr_path, _LINE_BAD),
+            ("--mem", resolved.mem, _STRICT_BAD),
+            ("--time", resolved.time_limit, _STRICT_BAD),
+            ("--gres", resolved.gres, _STRICT_BAD),
+        ):
+            if value and bad.search(value):
+                raise TaskExecutionError(
+                    _("Invalid value for %(option)s: %(value)r")
+                    % {"option": option, "value": value}
+                )
         lines = ["#!/bin/bash"]
         lines.append(f"#SBATCH --job-name={job_name}")
         lines.append(f"#SBATCH --output={stdout_path}")

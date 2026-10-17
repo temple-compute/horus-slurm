@@ -22,6 +22,7 @@ from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.event.base import BaseEvent
+from pydantic import ValidationError
 
 from horus_slurm.events import SlurmJobEvent
 from horus_slurm.record import (
@@ -284,6 +285,78 @@ class TestSubmission:
 
         assert f"#SBATCH --output={tmp_path}/stdout.log" in script
         assert f"#SBATCH --error={tmp_path}/stderr.log" in script
+
+
+@pytest.mark.unit
+class TestHeaderInjection:
+    """Nothing a value holds can add a directive, option or command."""
+
+    @pytest.mark.parametrize(
+        "field", ["partition", "account", "qos", "mem", "time_limit", "gres"]
+    )
+    @pytest.mark.parametrize(
+        "value",
+        ["a b", "a\tb", "a\nb", "a\rb", "a#b", "a'b", 'a"b', "a\\b", "a\x00b"],
+    )
+    def test_a_structured_field_is_one_token(
+        self, inner: FakeInner, field: str, value: str
+    ) -> None:
+        """Whitespace, comments, quotes and escapes are rejected on load."""
+        with pytest.raises(ValidationError, match=field):
+            _target(inner, **{field: value})
+
+    @pytest.mark.parametrize("value", ["a\nb", "a\rb", "a\x00b"])
+    def test_an_extra_arg_is_one_line(
+        self, inner: FakeInner, value: str
+    ) -> None:
+        """Free-form, but it cannot start another line."""
+        with pytest.raises(ValidationError, match="extra_sbatch_args"):
+            _target(inner, extra_sbatch_args=[value])
+
+    def test_valid_values_round_trip(self, inner: FakeInner) -> None:
+        """What tc-os stores loads back unchanged."""
+        target = _target(
+            inner,
+            partition="a,b",
+            gres="gpu:a100:1",
+            time_limit="1-00:00:00",
+            mem="4G",
+            extra_sbatch_args=[
+                "--mail-type=END --exclusive",
+                "--comment='x y'",
+            ],
+        )
+        again = SlurmTarget.model_validate_json(target.model_dump_json())
+        assert again.gres == "gpu:a100:1"
+        assert again.extra_sbatch_args == target.extra_sbatch_args
+
+    @pytest.mark.parametrize(
+        "walltime", ["1:00:00\n#SBATCH --x", "1:00:00 --x"]
+    )
+    def test_a_task_walltime_is_checked(
+        self, inner: FakeInner, tmp_path: Path, walltime: str
+    ) -> None:
+        """Task values skip the target's validators."""
+        target = _target(inner)
+        _bind(target, _Task(str(tmp_path), ResourceRequest(walltime=walltime)))
+        with pytest.raises(TaskExecutionError, match="--time"):
+            target._build_sbatch_script(
+                "run me", cwd=None, env=None, job_dir=str(tmp_path)
+            )
+
+    def test_a_log_path_is_one_line(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A working directory with a line break cannot add a directive."""
+        bad = f"{tmp_path}/x\n#SBATCH --x"
+        target = _target(inner)
+        _bind(target, _Task(bad))
+        with pytest.raises(TaskExecutionError, match="--output"):
+            target._build_sbatch_script(
+                "run me", cwd=None, env=None, job_dir=str(tmp_path)
+            )
+        with pytest.raises(TaskExecutionError, match="--output"):
+            target._pilot_script(bad)
 
 
 @pytest.mark.unit
