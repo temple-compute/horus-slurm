@@ -189,6 +189,9 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set by the run-end release so a step moving late cannot submit a
+    # pilot nobody cancels; the next run's first launch clears it.
+    closed: bool = False
     # One squeue reading shared by all copies, keyed by the job id it was
     # read for. Taken after `lock`, never before it.
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -370,6 +373,9 @@ class SlurmTarget(BaseTarget):
     accounting how it ended instead of waiting out the exit-code retries.
     """
 
+    _cancel_pending: bool = False
+    """Set when the cancel of a moved step failed; the next poll retries it."""
+
     _record: SlurmJobRecord | None = None
     """
     The job's durable record, rewritten on every state transition and exit
@@ -532,6 +538,7 @@ class SlurmTarget(BaseTarget):
                 ["#!/bin/bash", *self._script_body(cmd, cwd, env, job_dir)]
             )
             step = f"horus-{Path(job_dir).name}"
+            self._alloc.closed = False
             job_id, alloc_dir = await self._submit_step(
                 step, f"{script}\n", job_dir
             )
@@ -713,6 +720,7 @@ class SlurmTarget(BaseTarget):
             if reason in ("run_end", "abort"):
                 # Registered per run; a re-run registers its own.
                 handle.ready_callbacks.clear()
+                handle.closed = True
 
     async def keepalive(self) -> None:
         """
@@ -750,6 +758,10 @@ class SlurmTarget(BaseTarget):
                 if queue is not None and queue.gone:
                     handle.job_id = None
             if handle.job_id is None:
+                if handle.closed:
+                    raise TaskExecutionError(
+                        _("The allocation was released for this run.")
+                    )
                 handle.generation += 1
                 handle.queue_job_id = handle.queue = None
                 handle._partition_checked = None  # noqa: SLF001
@@ -916,13 +928,15 @@ class SlurmTarget(BaseTarget):
         not run.
         """
         handle = await self._allocation()
-        await self._spool_step(handle, step, script, job_dir)
-        return str(handle.job_id), handle.alloc_dir
+        # Read once: a copy may resubmit while this one spools.
+        job_id, alloc_dir = str(handle.job_id), handle.alloc_dir
+        await self._spool_step(job_id, alloc_dir, step, script, job_dir)
+        return job_id, alloc_dir
 
     async def _spool_step(
-        self, handle: _Allocation, step: str, script: str, job_dir: str
+        self, job_id: str, alloc_dir: str, step: str, script: str, job_dir: str
     ) -> None:
-        """Write the step script and launcher into handle.alloc_dir/spool."""
+        """Write the step script and launcher into alloc_dir/spool."""
         request = self._task.resources if self._task is not None else None
         # The task's own request, not the target's (the allocation's) size.
         step_res = resolve_resources(request)
@@ -941,7 +955,7 @@ class SlurmTarget(BaseTarget):
         gres = step_res.gres or ("none" if self.gres else None)
         stdout_path, stderr_path = self._log_paths(job_dir)
         q = shlex.quote
-        run = f"{handle.alloc_dir}/run/{step}"
+        run = f"{alloc_dir}/run/{step}"
         exit_path = q(f"{job_dir}/exit_code")
         cancel = q(f"{run}.cancel")
         srun = [
@@ -968,7 +982,7 @@ class SlurmTarget(BaseTarget):
             f"[ -e {exit_path} ] || echo $code > {exit_path}\n"
         )
         await self.inner.put_file(script.encode(), f"{run}.job")
-        spool = f"{handle.alloc_dir}/spool/{step}"
+        spool = f"{alloc_dir}/spool/{step}"
         await self.inner.put_file(launcher.encode(), f"{spool}.tmp")
         # Renamed whole, so the pilot never runs a half-written launcher.
         proc = await self.inner.run_command_sync(
@@ -989,7 +1003,7 @@ class SlurmTarget(BaseTarget):
         if not landed:
             raise TaskExecutionError(
                 _("Could not hand the task to allocation %(job_id)s.")
-                % {"job_id": handle.job_id}
+                % {"job_id": job_id}
             )
 
     async def _step_id(self, job_id: str, step: str) -> str | None:
@@ -1200,6 +1214,8 @@ class SlurmTarget(BaseTarget):
         """
         exit_code_path = f"{handle.job_dir}/exit_code"
         job_id = self._handle_job_id(handle)
+        if self._cancel_pending:
+            await self._cancel_moved(handle)
 
         # Announce before the exit_code short-circuit: a job that finishes
         # between two polls would otherwise never report having run.
@@ -1220,6 +1236,10 @@ class SlurmTarget(BaseTarget):
             await self._record_exit_code(exit_code)
             return exit_code
 
+        if gone and not self._cancelling and await self._requeue_step(handle):
+            return None
+
+        # Also when a cancel came in during a move that then failed.
         if gone and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
@@ -1230,8 +1250,6 @@ class SlurmTarget(BaseTarget):
         # A shared allocation's job id stays set: the run-end release still
         # cleans it up, and the next launch sees it gone and resubmits.
         if gone:
-            if await self._requeue_step(handle):
-                return None
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
             # disappears from squeue. Retry briefly before concluding it was
@@ -1280,35 +1298,55 @@ class SlurmTarget(BaseTarget):
             return False
         q = shlex.quote
         old = extra["alloc_dir"]
-        # No -f: only a launcher the pilot never claimed is ours to move.
-        proc = await self.inner.run_command_sync(
-            f"rm {q(f'{old}/spool/{step}.sh')}"
-        )
-        if await proc.wait() != 0:
-            return False
         try:
+            # No -f: only a launcher the pilot never claimed is ours to move.
+            proc = await self.inner.run_command_sync(
+                f"rm {q(f'{old}/spool/{step}.sh')}"
+            )
+            if await proc.wait() != 0:
+                return False
             alloc = await self._allocation()
+        except Exception as exc:
+            # Taken back or not, the step then fails as before.
+            horus_logger.log.error(
+                _("Could not move task step %(step)s: %(err)s")
+                % {"step": step, "err": exc}
+            )
+            return False
+        job_id, alloc_dir = str(alloc.job_id), alloc.alloc_dir
+        try:
             # Rebuilt, not moved: the old one points at the old dir.
             await self._spool_step(
-                alloc, step, self._record.script, handle.job_dir
+                job_id, alloc_dir, step, self._record.script, handle.job_dir
             )
         except Exception as exc:
             horus_logger.log.error(
                 _("Could not move task step %(step)s: %(err)s")
                 % {"step": step, "err": exc}
             )
-            return False
-        job_id = str(alloc.job_id)
+            # The launcher may have landed anyway: take it back, or keep
+            # watching it if the pilot has claimed it.
+            try:
+                proc = await self.inner.run_command_sync(
+                    f"! rm {q(f'{alloc_dir}/spool/{step}.sh')} 2>/dev/null "
+                    f"&& [ -e {q(f'{alloc_dir}/run/{step}.sh')} ]"
+                )
+                claimed = await proc.wait() == 0
+            except Exception:
+                # Unknown: watching beats a launcher nobody waits for.
+                claimed = True
+            if not claimed:
+                return False
         extra |= {
             "job_id": job_id,
             "raw_job_id": job_id,
-            "alloc_dir": alloc.alloc_dir,
+            "alloc_dir": alloc_dir,
             "moves": str(moves + 1),
         }
         self._record = self._record.model_copy(
             update={
                 "job_id": job_id,
-                "script_path": f"{alloc.alloc_dir}/run/{step}.job",
+                "script_path": f"{alloc_dir}/run/{step}.job",
             }
         )
         await self._publish_job_id(job_id, cwd=self._record.working_dir)
@@ -1316,8 +1354,23 @@ class SlurmTarget(BaseTarget):
         await self._announce(job_id, SUBMITTED)
         if self._cancelling:
             # Cancelled mid-move: the signal went to the old dir.
-            await self._signal_step(handle, job_id, step, signal.SIGTERM)
+            await self._cancel_moved(handle)
         return True
+
+    async def _cancel_moved(self, handle: JobHandle) -> None:
+        """Cancel a moved step; a failure is retried by the next poll."""
+        extra = handle.extra or {}
+        try:
+            await self._signal_step(
+                handle, extra["job_id"], extra["step"], signal.SIGTERM
+            )
+        except Exception as exc:
+            self._cancel_pending = True
+            horus_logger.log.debug(
+                _("Could not cancel the moved step: %(err)s") % {"err": exc}
+            )
+        else:
+            self._cancel_pending = False
 
     async def _record_exit_code(self, exit_code: int) -> None:
         """Persist the job's exit code on its record. Best effort."""

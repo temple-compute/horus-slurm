@@ -924,6 +924,155 @@ class TestOrphanMove:
         assert not await target._requeue_step(handle)
         assert inner.commands == []
 
+    async def test_a_lost_take_back_fails_the_step(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An SSH drop in the take-back does not escape poll."""
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        run = FakeInner.run_command_sync
+
+        async def spy(self: FakeInner, cmd: str, **kwargs: Any) -> Any:
+            if cmd.startswith("rm ") and "/spool/" in cmd:
+                raise OSError("connection lost")
+            return await run(self, cmd, **kwargs)
+
+        monkeypatch.setattr(FakeInner, "run_command_sync", spy)
+        _ended(inner)
+        assert await target.poll(handle) == 1
+        assert len(inner.commands_starting("sbatch")) == 1
+
+    async def test_a_failed_cancel_after_the_move_is_retried(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The next poll cancels the step in the new dir."""
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        allocation = SlurmTarget._allocation
+        signal_step = SlurmTarget._signal_step
+        calls: list[None] = []
+
+        async def cancelled(self: SlurmTarget) -> Any:
+            await self.send_signal(handle, signal_mod.SIGTERM)
+            return await allocation(self)
+
+        async def flaky(self: SlurmTarget, *args: Any) -> None:
+            calls.append(None)
+            # The first is the cancel, the second the one after the move.
+            if len(calls) == 2:
+                raise OSError("connection lost")
+            await signal_step(self, *args)
+
+        monkeypatch.setattr(SlurmTarget, "_allocation", cancelled)
+        monkeypatch.setattr(SlurmTarget, "_signal_step", flaky)
+        _ended(inner)
+        assert await target.poll(handle) is None
+        assert len(_spooled(tmp_path)) == 1
+        inner.responds(squeue=RUNNING)
+        assert await target.poll(handle) == 143
+        assert _spooled(tmp_path) == []
+
+    async def test_no_pilot_after_the_run_end_release(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A move that waited on the release submits nothing; a re-run does."""
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        allocation = SlurmTarget._allocation
+
+        async def released(self: SlurmTarget) -> Any:
+            await self.release("run_end")
+            return await allocation(self)
+
+        monkeypatch.setattr(SlurmTarget, "_allocation", released)
+        _ended(inner)
+        assert await target.poll(handle) == 1
+        assert len(inner.commands_starting("sbatch")) == 1
+
+        monkeypatch.setattr(SlurmTarget, "_allocation", allocation)
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 2
+
+    @pytest.mark.parametrize(
+        ("claimed", "moved"), [(False, False), (True, True)]
+    )
+    async def test_an_ambiguous_respool_is_taken_back_or_watched(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        claimed: bool,
+        moved: bool,
+    ) -> None:
+        """The mv ran but reported nothing, and the check failed too."""
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        inner.runs("! ")
+        run = FakeInner.run_command_sync
+
+        async def spy(self: FakeInner, cmd: str, **kwargs: Any) -> Any:
+            if cmd.startswith("mv ") and "/spool/" in cmd:
+                await (await run(self, cmd, **kwargs)).wait()
+                if claimed:
+                    (launcher,) = _spooled(tmp_path)
+                    launcher.rename(
+                        launcher.parent.parent / "run" / launcher.name
+                    )
+                return FakeProcess(returncode=-1)
+            if cmd.startswith("[ "):
+                raise OSError("connection lost")
+            return await run(self, cmd, **kwargs)
+
+        monkeypatch.setattr(FakeInner, "run_command_sync", spy)
+        _ended(inner)
+        result = await target.poll(handle)
+        assert (result is None) == moved
+        assert _spooled(tmp_path) == []
+        assert handle.extra is not None
+        assert (handle.extra["job_id"] == "23456") == moved
+
+    async def test_a_cancel_during_a_failed_move_does_not_wait(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Taken back and cancelled: no exit code will come."""
+
+        async def no_wait(*_args: Any) -> None:
+            raise AssertionError("waited for an exit code")
+
+        monkeypatch.setattr(SlurmTarget, "_retry_exit_code", no_wait)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        allocation = SlurmTarget._allocation
+
+        async def cancelled(self: SlurmTarget) -> Any:
+            await self.send_signal(handle, signal_mod.SIGTERM)
+            return await allocation(self)
+
+        monkeypatch.setattr(SlurmTarget, "_allocation", cancelled)
+        inner.responds(squeue=GONE, sbatch=FAILED)
+        assert await target.poll(handle) == 1
+
+    async def test_a_move_keeps_the_new_reading(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """One sbatch; the new task reuses the reading the move left."""
+        target = _shared(inner)
+        old = target.idle_copy()
+        old_handle = await _launch(old, tmp_path, "a")
+        inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
+        new = target.idle_copy()
+        new_handle = await _launch(new, tmp_path, "b")
+        inner.responds(squeue=RUNNING)
+        assert await new.poll(new_handle) is None
+        inner.responds(squeue=GONE)
+        assert await old.poll(old_handle) is None
+        assert old_handle.extra is not None
+        assert old_handle.extra["job_id"] == "23456"
+        assert len(inner.commands_starting("sbatch")) == 2
+        before = _squeues(inner)
+        assert await new.poll(new_handle) is None
+        assert _squeues(inner) == before
+
 
 @pytest.mark.unit
 class TestSettings:
