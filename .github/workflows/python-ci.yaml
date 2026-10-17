@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: [main, feat/shared-allocation]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -68,14 +71,19 @@ jobs:
           retention-days: 5
 
   integration:
+    # The cluster runs privileged containers: hosted runners only.
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      ITEST_PROJECT: horus-slurm-itest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
           cache: "pip"
@@ -83,10 +91,13 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
-      - name: Configure git for private repos
-        run: git config --global url."https://${{ secrets.ACTIONS_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
+      # The token lives only in this step's env, never in a git config the
+      # PR's tests could read.
       - name: Sync project dependencies
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: url.https://${{ secrets.ACTIONS_TOKEN }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
         run: uv sync --group dev
 
       # runner.temp is not available in job-level env
@@ -99,7 +110,7 @@ jobs:
       - name: Dump cluster logs
         if: failure()
         run: |
-          docker compose -p horus-slurm-itest -f tests/integration/cluster/compose.yaml logs || true
+          docker compose -p "$ITEST_PROJECT" -f tests/integration/cluster/compose.yaml logs || true
           find "$ITEST_DIR" -name pilot.log -print -exec cat {} + || true
 
       - name: Tear down cluster
@@ -107,7 +118,7 @@ jobs:
         run: make integration-down
 
       - name: Upload integration results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: integration-results
