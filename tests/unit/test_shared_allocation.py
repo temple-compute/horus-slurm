@@ -18,16 +18,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from horus_runtime.context import HorusContext
 from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
 
+from horus_slurm.events import SlurmJobEvent
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
 from .conftest import FakeInner, FakeProcess
 
 RUNNING = FakeProcess(stdout=b"RUNNING|node01|cpu\n")
+GONE = FakeProcess()
+FAILED = FakeProcess(returncode=1)
 
 
 class _Task:
@@ -83,6 +87,25 @@ async def _launch(
     return await target.launch(
         cmd, cwd=task.working_dir, env=None, job_dir=f"{tmp_path}/{name}"
     )
+
+
+def _squeues(inner: FakeInner) -> int:
+    return len(inner.commands_starting("squeue -h"))
+
+
+def _expire(target: SlurmTarget) -> None:
+    """Age the shared squeue reading past its interval."""
+    target._alloc.queue_at -= target.queue_check_interval
+
+
+async def _members(
+    target: SlurmTarget, tmp_path: Path, count: int
+) -> list[tuple[SlurmTarget, JobHandle]]:
+    members = []
+    for i in range(count):
+        member = target.idle_copy()
+        members.append((member, await _launch(member, tmp_path, f"t{i}")))
+    return members
 
 
 def _alloc_dirs(tmp_path: Path) -> list[Path]:
@@ -529,6 +552,267 @@ class TestCleanup:
         await _launch(target, tmp_path, "c")
         assert len(inner.commands_starting("sbatch")) == 3
         assert len(inner.commands_starting("cd -P ")) == 2
+
+
+@pytest.mark.unit
+class TestQueueCache:
+    """One squeue per allocation per interval, shared by every copy."""
+
+    async def test_fifty_copies_share_one_squeue(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        horus_context: HorusContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Also when they all poll at once; each still announces."""
+        events: list[SlurmJobEvent] = []
+        monkeypatch.setattr(horus_context.bus, "emit", events.append)
+        read = SlurmTarget._read_queue
+
+        async def slow(self: SlurmTarget, handle: JobHandle) -> Any:
+            await asyncio.sleep(0)  # let the herd queue on the lock
+            return await read(self, handle)
+
+        monkeypatch.setattr(SlurmTarget, "_read_queue", slow)
+        inner.responds(squeue=RUNNING)
+        members = await _members(_shared(inner), tmp_path, 50)
+        # The second launch's liveness check read it.
+        assert _squeues(inner) == 1
+
+        for member, handle in members:
+            assert await member.poll(handle) is None
+        assert _squeues(inner) == 1
+
+        _expire(members[0][0])
+        await asyncio.gather(*(m.poll(h) for m, h in members))
+        assert _squeues(inner) == 2
+
+        for member, _h in members:
+            assert member._record is not None
+            assert member._record.state == "RUNNING"
+        running = [e.task_id for e in events if e.state == "RUNNING"]
+        assert sorted(running) == sorted(f"t{i}" for i in range(50))
+
+    async def test_a_failed_read_is_not_cached(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Each poll tries again until squeue answers."""
+        inner.responds(squeue=FAILED)
+        target = _shared(inner)
+        (a, ha), (b, hb) = await _members(target, tmp_path, 2)
+        assert _squeues(inner) == 1
+        assert await a.poll(ha) is None
+        assert await b.poll(hb) is None
+        assert _squeues(inner) == 3
+
+        inner.responds(squeue=RUNNING)
+        await a.poll(ha)
+        await b.poll(hb)
+        assert _squeues(inner) == 4
+
+    async def test_copies_waiting_on_a_failed_read_share_it(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One squeue per round, not one per copy in turn."""
+        read = SlurmTarget._read_queue
+
+        async def slow(self: SlurmTarget, handle: JobHandle) -> Any:
+            await asyncio.sleep(0)  # let the herd queue on the lock
+            return await read(self, handle)
+
+        monkeypatch.setattr(SlurmTarget, "_read_queue", slow)
+        inner.responds(squeue=RUNNING)
+        members = await _members(_shared(inner), tmp_path, 50)
+        inner.responds(squeue=FAILED)
+        _expire(members[0][0])
+        before = _squeues(inner)
+        results = await asyncio.gather(*(m.poll(h) for m, h in members))
+        assert results == [None] * 50
+        assert _squeues(inner) == before + 1
+        # The next round tries again.
+        await members[0][0].poll(members[0][1])
+        assert _squeues(inner) == before + 2
+
+    async def test_a_failed_read_is_not_gone(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The allocation is kept and not submitted again."""
+        inner.responds(squeue=FAILED)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        assert await target.poll(handle) is None
+        assert target.is_live
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 1
+
+    async def test_a_new_allocation_starts_with_no_reading(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The fake reuses job ids: a stale "" must not fail new tasks."""
+        inner.responds(squeue=GONE)
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        assert await target.poll(handle) == 1
+
+        inner.responds(squeue=RUNNING)
+        member = target.idle_copy()
+        new = await _launch(member, tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 2
+        before = _squeues(inner)
+        assert await member.poll(new) is None
+        assert _squeues(inner) == before + 1
+
+    async def test_an_ended_allocation_is_kept_for_release(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Polls leave the job id, so the run-end release cleans it up."""
+        target = _shared(inner, exit_code_retries=0)
+        old = target.idle_copy()
+        old_handle = await _launch(old, tmp_path, "a")
+        inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
+        new = target.idle_copy()
+        new_handle = await _launch(new, tmp_path, "b")
+        assert target._alloc.job_id == "23456"
+
+        assert await old.poll(old_handle) == 1
+        assert await new.poll(new_handle) == 1
+        assert target._alloc.job_id == "23456"
+        assert target.is_live
+        assert list((tmp_path / ALLOC_DIR).glob("*-2/spool"))
+
+        await target.release("run_end")
+        assert not target.is_live
+        assert not list((tmp_path / ALLOC_DIR).glob("*-2/spool"))
+
+    async def test_an_ended_state_is_gone(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Still listed until MinJobAge: fail and resubmit."""
+        inner.responds(squeue=FakeProcess(stdout=b"CANCELLED|None|cpu\n"))
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        assert await target.poll(handle) == 1
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 2
+
+    async def test_an_old_task_keeps_the_new_reading(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A task of an ended allocation does not evict its successor's."""
+        target = _shared(inner, exit_code_retries=0)
+        old = target.idle_copy()
+        old_handle = await _launch(old, tmp_path, "a")
+        inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
+        new = target.idle_copy()
+        new_handle = await _launch(new, tmp_path, "b")
+        inner.responds(squeue=RUNNING)
+        assert await new.poll(new_handle) is None
+        inner.responds(squeue=GONE)
+        assert await old.poll(old_handle) == 1
+        before = _squeues(inner)
+        assert await new.poll(new_handle) is None
+        assert _squeues(inner) == before
+
+    async def test_a_launch_reuses_a_fresh_reading(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """No liveness squeue within the interval, one after it."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        assert _squeues(inner) == 1
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert _squeues(inner) == 1
+        _expire(target)
+        await _launch(target.idle_copy(), tmp_path, "c")
+        assert _squeues(inner) == 2
+
+    async def test_an_ended_allocation_is_seen_after_the_interval(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Within it a launch still spools into it (accepted window)."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        inner.responds(squeue=GONE)
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 1
+        _expire(target)
+        await _launch(target.idle_copy(), tmp_path, "c")
+        assert len(inner.commands_starting("sbatch")) == 2
+
+    async def test_fifty_copies_share_one_sinfo(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """While pending on nodes, one partition summary for all."""
+        sinfo = SlurmTarget._sinfo
+
+        async def slow(self: SlurmTarget, partition: str | None) -> Any:
+            await asyncio.sleep(0)  # let the herd poll meanwhile
+            return await sinfo(self, partition)
+
+        monkeypatch.setattr(SlurmTarget, "_sinfo", slow)
+        inner.responds(
+            squeue=FakeProcess(stdout=b"PENDING|(Resources)|gpu\n"),
+            sinfo=FakeProcess(stdout=b"idle|0\nmixed|1\n"),
+        )
+        members = await _members(_shared(inner), tmp_path, 50)
+        await asyncio.gather(*(m.poll(h) for m, h in members))
+        assert len(inner.commands_starting("sinfo")) == 1
+        for member, _h in members:
+            assert member._record is not None
+            assert member._record.partition_nodes == {"idle": 0, "mixed": 1}
+
+    async def test_inline_targets_read_their_own(
+        self, inner: FakeInner
+    ) -> None:
+        """No sharing: one squeue per read."""
+        inner.responds(squeue=RUNNING)
+        handle = JobHandle(pid=None, job_dir="", extra={"job_id": "1"})
+        for target in (SlurmTarget(inner=inner), SlurmTarget(inner=inner)):
+            await target._queue_state(handle)
+            await target._queue_state(handle)
+        assert _squeues(inner) == 4
+
+
+@pytest.mark.unit
+class TestSettings:
+    """Poll and queue check intervals are target fields."""
+
+    def test_poll_seconds_sets_the_poll_interval(
+        self, inner: FakeInner
+    ) -> None:
+        """The runtime reads poll_interval off the instance."""
+        assert SlurmTarget(inner=inner).poll_interval == 5.0
+        target = SlurmTarget(inner=inner, poll_seconds=10)
+        assert target.poll_interval == 10
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("poll_seconds", 4), ("queue_check_interval", 121)],
+    )
+    def test_out_of_bounds_is_refused(
+        self, inner: FakeInner, field: str, value: float
+    ) -> None:
+        """Faster polls load the login node; slower ones outlive MinJobAge."""
+        fields: dict[str, Any] = {field: value}
+        with pytest.raises(ValueError):
+            SlurmTarget(inner=inner, **fields)
+
+    def test_the_schema_exposes_both(self) -> None:
+        """So the target form shows them."""
+        props = SlurmTarget.model_json_schema()["properties"]
+        assert props["poll_seconds"]["default"] == 5.0
+        assert props["queue_check_interval"]["default"] == 30.0
 
 
 @pytest.mark.unit

@@ -83,6 +83,23 @@ job waits on hardware, and whether that hardware is busy, drained or down is
 what the user needs to know next.
 """
 
+ENDED_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "TIMEOUT",
+    }
+)
+"""
+States ``squeue`` may still list an ended job in until ``MinJobAge`` passes.
+"""
+
 PARTITION_SUMMARY_INTERVAL = 60.0
 """Seconds between ``sinfo`` reads while the pending reason is unchanged."""
 
@@ -94,6 +111,11 @@ class QueueState(NamedTuple):
     reason: str | None = None
     nodes: str | None = None
     partition: str | None = None
+
+    @property
+    def gone(self) -> bool:
+        """Whether the job has left the queue or ended."""
+        return self.state == "" or self.state in ENDED_STATES
 
 
 ALLOC_DIR = ".horus_alloc"
@@ -167,6 +189,27 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # One squeue reading shared by all copies, keyed by the job id it was
+    # read for. Taken after `lock`, never before it.
+    refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue_job_id: str | None = None
+    queue: QueueState | None = None
+    queue_at: float = 0.0
+    # (job id, monotonic time) of the last failed read, so the copies that
+    # waited on it give up too instead of each retrying in turn.
+    queue_failed: tuple[str, float] | None = None
+    # The shared copies of SlurmTarget's sinfo cache.
+    _partition_checked: tuple[str, float] | None = None
+    _partition_nodes: dict[str, int] | None = None
+
+    def cached_queue(self, job_id: str, interval: float) -> QueueState | None:
+        """The reading for *job_id* if under *interval* seconds old."""
+        if (
+            self.queue_job_id == job_id
+            and time.monotonic() - self.queue_at < interval
+        ):
+            return self.queue
+        return None
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _Allocation:
         """A deep copy is a separate declared target: no allocation yet."""
@@ -279,10 +322,22 @@ class SlurmTarget(BaseTarget):
     # short control-plane commands (see run_command_sync below).
     detach_by_default: ClassVar[bool] = True
 
-    # Slurm clusters are usually contacted infrequently; the default 1.0s
-    # from BaseTarget is fine, but you may want to raise this to reduce
-    # squeue/sacct load on shared login nodes with many concurrent jobs.
-    poll_interval: ClassVar[float] = 5.0
+    poll_seconds: float = Field(
+        default=5.0,
+        ge=5,
+        le=300,
+        title=_("Poll interval"),
+        description=_("Seconds between checks of each task's exit file"),
+    )
+    queue_check_interval: float = Field(
+        default=30.0,
+        # Below Slurm's default MinJobAge (300 s), so an ended job is still
+        # listed on the next read.
+        ge=5,
+        le=120,
+        title=_("Queue check interval"),
+        description=_("Seconds between squeue checks of a shared allocation"),
+    )
     exit_code_retries: int = 5
     exit_code_delay: float = 5.0
 
@@ -537,6 +592,11 @@ class SlurmTarget(BaseTarget):
         return self._ref is not None
 
     @property
+    def poll_interval(self) -> float:  # type: ignore[override]
+        """Seconds between polls: :attr:`poll_seconds`."""
+        return self.poll_seconds
+
+    @property
     def hold_timeout_s(self) -> float | None:
         """The hold window in seconds."""
         return self.hold_timeout_minutes * 60.0 if self.releasable else None
@@ -680,10 +740,13 @@ class SlurmTarget(BaseTarget):
                         pid=None, job_dir="", extra={"job_id": handle.job_id}
                     )
                 )
-                if queue is not None and queue.state == "":
+                if queue is not None and queue.gone:
                     handle.job_id = None
             if handle.job_id is None:
                 handle.generation += 1
+                handle.queue_job_id = handle.queue = None
+                handle._partition_checked = None  # noqa: SLF001
+                handle._partition_nodes = None  # noqa: SLF001
                 root = f"{self.resolved_working_directory}/{ALLOC_DIR}"
                 alloc_dir = (
                     f"{root}/{self._ref}.{self.lease_key}-{handle.generation}"
@@ -1134,7 +1197,7 @@ class SlurmTarget(BaseTarget):
         # Announce before the exit_code short-circuit: a job that finishes
         # between two polls would otherwise never report having run.
         queue = await self._queue_state(handle)
-        state = queue.state if queue is not None else None
+        gone = queue is not None and queue.gone
         if queue is not None and queue.state:
             await self._announce(
                 job_id,
@@ -1150,14 +1213,16 @@ class SlurmTarget(BaseTarget):
             await self._record_exit_code(exit_code)
             return exit_code
 
-        if state == "" and self._cancelling:
+        if gone and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
             final = await self._final_state(handle)
             await self._announce(job_id, *(final or ("CANCELLED", None)))
             return 1
 
-        if state == "":
+        # A shared allocation's job id stays set: the run-end release still
+        # cleans it up, and the next launch sees it gone and resubmits.
+        if gone:
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
             # disappears from squeue. Retry briefly before concluding it was
@@ -1474,6 +1539,43 @@ class SlurmTarget(BaseTarget):
 
     async def _queue_state(self, handle: JobHandle) -> QueueState | None:
         """
+        :meth:`_read_queue`, shared by a named target's copies: one read per
+        :attr:`queue_check_interval`. A failed read is never stored, but the
+        copies waiting on it share it rather than each trying again.
+        """
+        if not self.releasable:
+            return await self._read_queue(handle)
+        alloc = self._alloc
+        job_id = self._handle_job_id(handle)
+        cached = alloc.cached_queue(job_id, self.queue_check_interval)
+        if cached is not None:
+            return cached
+        waited_from = time.monotonic()
+        async with alloc.refresh_lock:
+            # Another copy may have read it while this one waited.
+            cached = alloc.cached_queue(job_id, self.queue_check_interval)
+            if cached is not None:
+                return cached
+            failed = alloc.queue_failed
+            if (
+                failed is not None
+                and failed[0] == job_id
+                and failed[1] >= waited_from
+            ):
+                return None
+            queue = await self._read_queue(handle)
+            if queue is None:
+                alloc.queue_failed = (job_id, time.monotonic())
+            elif job_id == alloc.job_id:
+                # A task of an ended allocation must not evict the
+                # current one's reading.
+                alloc.queue_job_id = job_id
+                alloc.queue = queue
+                alloc.queue_at = time.monotonic()
+            return queue
+
+    async def _read_queue(self, handle: JobHandle) -> QueueState | None:
+        """
         What ``squeue`` says about the job right now.
 
         Returns the state (``PENDING``, ``RUNNING``, …) with ``%R`` split into
@@ -1521,23 +1623,32 @@ class SlurmTarget(BaseTarget):
         Re-read when the reason changes, and otherwise at most every
         :data:`PARTITION_SUMMARY_INTERVAL` seconds.
         """
+        # A named target's copies share one sinfo read.
+        cache = self._alloc if self.releasable else self
         reason = queue.reason or ""
         if queue.state != "PENDING" or not reason.startswith(NODE_REASONS):
-            self._partition_checked = None
-            self._partition_nodes = None
+            cache._partition_checked = None  # noqa: SLF001
+            cache._partition_nodes = None  # noqa: SLF001
             return None
-        now = time.monotonic()
-        if (
-            self._partition_checked is not None
-            and self._partition_checked[0] == reason
-            and now - self._partition_checked[1] < PARTITION_SUMMARY_INTERVAL
-        ):
-            return self._partition_nodes
-        self._partition_checked = (reason, now)
-        self._partition_nodes = await self._sinfo(
-            self.partition or queue.partition
-        )
-        return self._partition_nodes
+
+        def fresh() -> bool:
+            checked = cache._partition_checked  # noqa: SLF001
+            return (
+                checked is not None
+                and checked[0] == reason
+                and time.monotonic() - checked[1] < PARTITION_SUMMARY_INTERVAL
+            )
+
+        if fresh():
+            return cache._partition_nodes  # noqa: SLF001
+        # Copies polling meanwhile wait for this read, not the old summary.
+        async with self._alloc.refresh_lock:
+            if fresh():
+                return cache._partition_nodes  # noqa: SLF001
+            nodes = await self._sinfo(self.partition or queue.partition)
+            cache._partition_nodes = nodes  # noqa: SLF001
+            cache._partition_checked = (reason, time.monotonic())  # noqa: SLF001
+            return nodes
 
     async def _sinfo(self, partition: str | None) -> dict[str, int] | None:
         """
