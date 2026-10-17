@@ -340,6 +340,35 @@ class TestHeaderInjection:
         assert target.extra_sbatch_args == ["--x"]
         assert to_slurm_time("01:00:00 ") == "01:00:00"
 
+    @pytest.mark.parametrize("task_dir", ["a --qos=x", "a#b", 'a"b'])
+    def test_a_log_path_is_one_token(
+        self, inner: FakeInner, tmp_path: Path, task_dir: str
+    ) -> None:
+        """The task dir is in the log paths; the error names the cause."""
+        target = _target(inner)
+        _bind(target, _Task(str(tmp_path / task_dir)))
+        with pytest.raises(TaskExecutionError, match="working directory"):
+            target._build_sbatch_script(
+                "run me", cwd=None, env=None, job_dir=str(tmp_path)
+            )
+
+    def test_an_assigned_field_is_checked(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Assignment skips the validators, not the header check."""
+        target = _target(inner)
+        target.partition = "debug --uid=0"
+        with pytest.raises(TaskExecutionError, match="--partition"):
+            target._build_sbatch_script(
+                "run me", cwd=None, env=None, job_dir=str(tmp_path)
+            )
+        target.partition = None
+        target.extra_sbatch_args = ["--x\n#SBATCH --y"]
+        with pytest.raises(TaskExecutionError, match="line break"):
+            target._build_sbatch_script(
+                "run me", cwd=None, env=None, job_dir=str(tmp_path)
+            )
+
     @pytest.mark.parametrize(
         "walltime", ["1:00:00\n#SBATCH --x", "1:00:00 --x"]
     )

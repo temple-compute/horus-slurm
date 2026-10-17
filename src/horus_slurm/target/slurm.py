@@ -139,8 +139,8 @@ _JOB_ID = re.compile(r"\d+(_\d+)?")
 """A job id as sbatch prints it, before it goes into another command."""
 
 # sbatch splits #SBATCH lines on newlines and options on any whitespace, and
-# reads quotes, backslashes and an unquoted `#` too. Structured values need
-# none of these; free-form ones may hold anything but a new line.
+# reads quotes, backslashes and an unquoted `#` too. Values and paths need
+# none of these; extra_sbatch_args may hold anything but a new line.
 _STRICT_BAD = re.compile(r"[\s#'\"\\\x00]")
 _LINE_BAD = re.compile(r"[\n\r\x00]")
 
@@ -1348,20 +1348,36 @@ class SlurmTarget(BaseTarget):
         resolved: SbatchResources,
     ) -> list[str]:
         """The shebang and ``#SBATCH`` lines of a batch script."""
-        # Target fields are validated on load; these come from the task
-        # and its paths.
-        for option, value, bad in (
-            ("--job-name", job_name, _LINE_BAD),
-            ("--output", stdout_path, _LINE_BAD),
-            ("--error", stderr_path, _LINE_BAD),
-            ("--mem", resolved.mem, _STRICT_BAD),
-            ("--time", resolved.time_limit, _STRICT_BAD),
-            ("--gres", resolved.gres, _STRICT_BAD),
+        # Checked here too: the validators run on load, not on assignment.
+        for option, value in (
+            ("--job-name", job_name),
+            ("--output", stdout_path),
+            ("--error", stderr_path),
+            ("--partition", self.partition),
+            ("--account", self.account),
+            ("--qos", self.qos),
+            ("--mem", resolved.mem),
+            ("--time", resolved.time_limit),
+            ("--gres", resolved.gres),
         ):
-            if value and bad.search(value):
+            if value and _STRICT_BAD.search(value):
                 raise TaskExecutionError(
-                    _("Invalid value for %(option)s: %(value)r")
+                    _(
+                        "Invalid value for %(option)s: %(value)r may not "
+                        "contain whitespace, '#', quotes or backslashes."
+                    )
                     % {"option": option, "value": value}
+                    + (
+                        _(" Check the working directory and the task id.")
+                        if option in ("--output", "--error")
+                        else ""
+                    )
+                )
+        for arg in self.extra_sbatch_args:
+            if _LINE_BAD.search(arg):
+                raise TaskExecutionError(
+                    _("Invalid extra sbatch argument %(arg)r: a line break.")
+                    % {"arg": arg}
                 )
         lines = ["#!/bin/bash"]
         lines.append(f"#SBATCH --job-name={job_name}")
