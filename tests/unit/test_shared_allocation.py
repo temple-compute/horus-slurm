@@ -1354,6 +1354,23 @@ class TestAllocationEvents:
 
         assert [e.phase for e in phases] == ["queued", "ready", "released"]
 
+    async def test_a_short_member_is_ready_on_exit_code(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """It finished while the cached reading still said pending."""
+        inner.responds(squeue=FakeProcess(stdout=b"PENDING|(Resources)|cpu\n"))
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        (tmp_path / "a" / "exit_code").write_text("0\n")
+        assert await target.poll(handle) == 0
+        target.emit_node_phase("holding")
+
+        assert [e.phase for e in phases] == ["queued", "ready", "holding"]
+
     async def test_release_is_announced_once(
         self,
         inner: FakeInner,

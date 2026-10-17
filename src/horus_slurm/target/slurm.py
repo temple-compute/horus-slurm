@@ -1293,6 +1293,9 @@ class SlurmTarget(BaseTarget):
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
             exit_code = int(raw.decode().strip())
+            # The pilot ran, even if the cached reading still says pending.
+            if job_id == self._alloc.job_id and not gone:
+                self._emit_allocation("ready")
             await self._record_exit_code(exit_code)
             return exit_code
 
