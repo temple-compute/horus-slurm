@@ -308,6 +308,13 @@ class SlurmTarget(BaseTarget):
         le=365,
         title=_("Allocation folder retention (days)"),
     )
+    # Stops a step bouncing between allocations that die before they start.
+    max_step_moves: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        title=_("Task moves to a new allocation"),
+    )
 
     # The allocation's files live on the cluster's shared filesystem, so a
     # released allocation loses no output. A node-local working_directory
@@ -1223,6 +1230,8 @@ class SlurmTarget(BaseTarget):
         # A shared allocation's job id stays set: the run-end release still
         # cleans it up, and the next launch sees it gone and resubmits.
         if gone:
+            if await self._requeue_step(handle):
+                return None
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
             # disappears from squeue. Retry briefly before concluding it was
@@ -1250,6 +1259,65 @@ class SlurmTarget(BaseTarget):
             return 1
 
         return None
+
+    async def _requeue_step(self, handle: JobHandle) -> bool:
+        """
+        Move a step its ended allocation never started into a live one.
+
+        True when moved: *handle* now points at the new allocation. False
+        when the caller should fail it as before (claimed, cancelled, out
+        of moves, inline target, or the move failed). Never raises.
+        """
+        extra = handle.extra or {}
+        step = extra.get("step")
+        moves = int(extra.get("moves", "0"))
+        if (
+            step is None
+            or self._cancelling
+            or self._record is None
+            or moves >= self.max_step_moves
+        ):
+            return False
+        q = shlex.quote
+        old = extra["alloc_dir"]
+        # No -f: only a launcher the pilot never claimed is ours to move.
+        proc = await self.inner.run_command_sync(
+            f"rm {q(f'{old}/spool/{step}.sh')}"
+        )
+        if await proc.wait() != 0:
+            return False
+        try:
+            alloc = await self._allocation()
+            # Rebuilt, not moved: the old one points at the old dir.
+            await self._spool_step(
+                alloc, step, self._record.script, handle.job_dir
+            )
+        except Exception as exc:
+            horus_logger.log.error(
+                _("Could not move task step %(step)s: %(err)s")
+                % {"step": step, "err": exc}
+            )
+            return False
+        job_id = str(alloc.job_id)
+        extra |= {
+            "job_id": job_id,
+            "raw_job_id": job_id,
+            "alloc_dir": alloc.alloc_dir,
+            "moves": str(moves + 1),
+        }
+        self._record = self._record.model_copy(
+            update={
+                "job_id": job_id,
+                "script_path": f"{alloc.alloc_dir}/run/{step}.job",
+            }
+        )
+        await self._publish_job_id(job_id, cwd=self._record.working_dir)
+        self._last_state = None
+        await self._announce(job_id, SUBMITTED)
+        if self._cancelling:
+            # Cancelled mid-move: the signal went to the old dir.
+            await self._signal_step(handle, job_id, step, signal.SIGTERM)
+        return True
 
     async def _record_exit_code(self, exit_code: int) -> None:
         """Persist the job's exit code on its record. Best effort."""
