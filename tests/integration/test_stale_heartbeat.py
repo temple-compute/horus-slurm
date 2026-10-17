@@ -20,7 +20,7 @@ import pytest
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import SlurmTarget
 
-from .conftest import _launch, poll_until, sh, wait_for
+from .conftest import _launch, job_state, poll_until, sh, wait_for
 
 
 @pytest.fixture(autouse=True)
@@ -30,11 +30,6 @@ def _short_stale(monkeypatch: pytest.MonkeyPatch) -> None:
     loop = slurm_mod.PILOT_LOOP.replace("-gt 900", "-gt 10")
     assert loop != slurm_mod.PILOT_LOOP
     monkeypatch.setattr(slurm_mod, "PILOT_LOOP", loop)
-
-
-async def _state(target: SlurmTarget, job: str) -> str:
-    _rc, out, _err = await sh(target, f"squeue -h -j {job} -o %T")
-    return out.strip()
 
 
 @pytest.mark.integration
@@ -51,7 +46,7 @@ async def test_stale_heartbeat_ends_allocation(
     os.utime(alloc / "heartbeat", (old, old))
 
     async def gone() -> bool:
-        return not await _state(target, job)
+        return not await job_state(target, job)
 
     await wait_for(gone, 20)
 
@@ -83,7 +78,7 @@ async def test_keepalive_holds_allocation(
         assert await poll_until(target, handle, 60) == 0
         await asyncio.sleep(15)
         job = target._handle_job_id(handle)
-        assert await _state(target, job) == "RUNNING"
+        assert await job_state(target, job) == "RUNNING"
     finally:
         beating.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -18,7 +18,7 @@ import pytest
 from horus_slurm.record import STDERR_FILE, STDOUT_FILE
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
-from .conftest import _launch, poll_until, sh, wait_for
+from .conftest import _launch, job_state, poll_until, wait_for
 
 
 @pytest.mark.integration
@@ -54,8 +54,7 @@ async def test_round_trip(
     await target.release("run_end")
 
     async def gone() -> bool:
-        _rc, out, _err = await sh(target, f"squeue -h -j {job} -o %T")
-        return not out.strip()
+        return not await job_state(target, job)
 
     await wait_for(gone, 20)
     assert not (alloc / "spool").exists()

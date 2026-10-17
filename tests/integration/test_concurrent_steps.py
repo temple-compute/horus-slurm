@@ -15,7 +15,7 @@ import pytest
 
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
-from .conftest import _launch, poll_until, sh, wait_for
+from .conftest import _launch, poll_until, sh, steps, wait_for
 
 
 def _barrier(d: Path, me: str, other: str) -> str:
@@ -43,9 +43,9 @@ async def test_two_steps_run_at_once(
     assert target.generation == 1
     # Every sbatch of the pilot gets its own allocation dir.
     assert len(list(d.glob(f"{ALLOC_DIR}/*"))) == 1
-    _rc, out, _err = await sh(target, f"squeue -s -h -j {job} -o %i")
-    steps = [s for s in out.split() if not s.endswith((".batch", ".extern"))]
-    assert sorted(steps) == [f"{job}.0", f"{job}.1"]
+    rc, out, err = await sh(target, f"squeue -s -h -j {job} -o %i")
+    assert rc == 0, err
+    assert sorted(steps(out)) == [f"{job}.0", f"{job}.1"]
 
     (d / "go").touch()
     assert await poll_until(target, a, 30) == 0

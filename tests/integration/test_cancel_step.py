@@ -16,7 +16,7 @@ import pytest
 
 from horus_slurm.target.slurm import SlurmTarget
 
-from .conftest import _launch, poll_until, sh, wait_for
+from .conftest import _launch, job_state, poll_until, sh, steps, wait_for
 
 
 class _F1Error(AssertionError):
@@ -44,10 +44,10 @@ async def test_cancel_step_waiting_for_resources(
     job, alloc = a.extra["job_id"], Path(b.extra["alloc_dir"])
 
     async def a_runs_b_claimed() -> bool:
-        _rc, out, _err = await sh(target, f"squeue -s -h -j {job} -o %i")
-        steps = [s for s in out.split() if s.split(".")[-1].isdigit()]
+        rc, out, err = await sh(target, f"squeue -s -h -j {job} -o %i")
+        assert rc == 0, err
         return (
-            len(steps) == 1
+            len(steps(out)) == 1
             and (alloc / "run" / "horus-b.sh").exists()
             and not (alloc / "spool" / "horus-b.sh").exists()
         )
@@ -58,8 +58,7 @@ async def test_cancel_step_waiting_for_resources(
     stdout, _ = await other.read_output(b)
     assert b"ran" not in stdout
 
-    _rc, state, _err = await sh(target, f"squeue -h -j {job} -o %T")
-    assert state.strip() == "RUNNING"
+    assert await job_state(target, job) == "RUNNING"
     assert await target.poll(a) is None
     (d / "go").touch()
     assert await poll_until(target, a, 30) == 0
@@ -83,8 +82,7 @@ async def test_cancel_spooled_step(
     blocker = out.strip()
 
     async def blocker_runs() -> bool:
-        _rc, out, _err = await sh(target, f"squeue -h -j {blocker} -o %T")
-        return out.strip() == "RUNNING"
+        return await job_state(target, blocker) == "RUNNING"
 
     await wait_for(blocker_runs, 60)
     b = await _launch(target, d, "b", "echo ran", cpus=1)

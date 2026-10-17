@@ -16,7 +16,7 @@ import pytest
 
 from horus_slurm.target.slurm import SlurmTarget
 
-from .conftest import _launch, poll_until, sh, wait_for
+from .conftest import _launch, job_state, poll_until, sh, wait_for
 
 
 @pytest.mark.integration
@@ -33,8 +33,7 @@ async def test_pilot_carries_no_requeue(
     job = handle.extra["job_id"]
 
     async def running() -> bool:
-        _rc, out, _err = await sh(target, f"squeue -h -j {job} -o %T")
-        return out.strip() == "RUNNING"
+        return await job_state(target, job) == "RUNNING"
 
     await wait_for(running, 60)
     _rc, show, _err = await sh(target, f"scontrol show job {job}")

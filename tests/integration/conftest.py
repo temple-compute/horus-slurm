@@ -16,6 +16,7 @@ container, so file operations stay local. Start the cluster with
 import asyncio
 import inspect
 import os
+import re
 import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
@@ -55,12 +56,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
 ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
-    """On a failed test, attach every pilot.log under its itest_dir."""
+    """On a failed phase, attach every pilot.log under its itest_dir."""
+    del call
     report = yield
     root = item.stash.get(_ITEST_DIR_KEY, None)
-    if report.failed and call.when == "call" and root is not None:
+    if report.failed and root is not None:
         for log in sorted(root.glob(f"{ALLOC_DIR}/*/pilot.log")):
-            report.sections.append((str(log), log.read_text()))
+            report.sections.append((str(log), log.read_text(errors="replace")))
     return report
 
 
@@ -80,7 +82,7 @@ class ExecInner(LocalTarget):
         env: dict[str, str] | None = None,
     ) -> ChannelProcess:
         """Run *cmd* with ``bash -c`` inside the login container."""
-        argv = ["docker", "exec", "-i", "-u", str(os.getuid())]
+        argv = ["docker", "exec", "-u", str(os.getuid())]
         argv += ["-w", cwd or self.resolved_working_directory]
         for key, value in (env or {}).items():
             argv += ["-e", f"{key}={value}"]
@@ -146,10 +148,25 @@ async def shared_target(
         return target
 
     yield make
+    errors: list[Exception] = []
     for target in made:
-        await target.release("run_end")
+        try:
+            await target.release("run_end")
+        except Exception as exc:
+            errors.append(exc)
     proc = await inner.run_command_sync("scancel --me")
     await proc.wait()
+
+    # The next test wants idle nodes, and scancel returns before the jobs
+    # have left the queue.
+    async def queue_empty() -> bool:
+        proc = await inner.run_command_sync("squeue --me -h")
+        out, _err = await proc.communicate()
+        return proc.returncode == 0 and not out.strip()
+
+    await wait_for(queue_empty, 60)
+    if errors:
+        raise errors[0]
 
 
 class _Task:
@@ -217,6 +234,19 @@ async def sh(target: SlurmTarget, cmd: str) -> tuple[int | None, str, str]:
         out.decode(errors="replace"),
         err.decode(errors="replace"),
     )
+
+
+async def job_state(target: SlurmTarget, job: str) -> str:
+    """The job's ``squeue`` state, or "" once it has left the queue."""
+    rc, out, err = await sh(target, f"squeue -h -j {job} -o %T")
+    # With MinJobAge=5 a finished job is soon unknown to squeue.
+    assert rc == 0 or "invalid job id" in err.lower(), err
+    return out.strip()
+
+
+def steps(out: str) -> list[str]:
+    """The real step ids in ``squeue -s -o %i`` output."""
+    return [s for s in out.split() if re.fullmatch(r"\d+(_\d+)?\.\d+", s)]
 
 
 async def poll_until(
