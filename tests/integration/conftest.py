@@ -206,3 +206,30 @@ async def wait_for(
         if asyncio.get_running_loop().time() > deadline:
             pytest.fail(f"condition not met within {timeout} s")
         await asyncio.sleep(interval)
+
+
+async def sh(target: SlurmTarget, cmd: str) -> tuple[int | None, str, str]:
+    """Run *cmd* on the login node; its exit code, stdout and stderr."""
+    proc = await target.run_command_sync(cmd)
+    out, err = await proc.communicate()
+    return (
+        proc.returncode,
+        out.decode(errors="replace"),
+        err.decode(errors="replace"),
+    )
+
+
+async def poll_until(
+    target: SlurmTarget, handle: JobHandle, timeout: float
+) -> int:
+    """The exit code ``poll`` reports within *timeout* seconds."""
+    codes: list[int] = []
+
+    async def done() -> bool:
+        code = await target.poll(handle)
+        if code is not None:
+            codes.append(code)
+        return code is not None
+
+    await wait_for(done, timeout)
+    return codes[0]
