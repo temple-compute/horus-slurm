@@ -1324,8 +1324,12 @@ class SlurmTarget(BaseTarget):
         if gone and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
-            final = await self._final_state(handle)
-            await self._announce(job_id, *(final or ("CANCELLED", None)))
+            state, reason, _code = await self._final_state(handle) or (
+                "CANCELLED",
+                None,
+                None,
+            )
+            await self._announce(job_id, state, reason)
             return 1
 
         # A shared allocation's job id stays set: the run-end release still
@@ -1336,26 +1340,32 @@ class SlurmTarget(BaseTarget):
             # disappears from squeue. Retry briefly before concluding it was
             # killed by the scheduler (OOM, node failure, wall-time) or
             # cancelled outside Horus.
-            retried_code = await self._retry_exit_code(exit_code_path)
-            if retried_code is not None:
-                await self._record_exit_code(retried_code)
-                return retried_code
-
-            # sacct usually knows what killed it (TIMEOUT, OUT_OF_MEMORY,
-            # NODE_FAIL, ...); GONE only when accounting cannot say.
-            final_state, reason = await self._final_state(handle) or (
-                GONE,
-                None,
-            )
-            await self._announce(job_id, final_state, reason)
-            horus_logger.log.error(
-                _(
-                    "The job vanished from queue without writing an exit "
-                    "code (%(state)s)."
-                )
-                % {"state": final_state}
-            )
-            return 1
+            code = await self._retry_exit_code(exit_code_path)
+            if code is None:
+                # sacct usually knows what killed it (TIMEOUT, OUT_OF_MEMORY,
+                # NODE_FAIL, ...); GONE only when accounting cannot say.
+                final_state, reason, code = await self._final_state(
+                    handle
+                ) or (GONE, None, None)
+                await self._announce(job_id, final_state, reason)
+                # The script exits with the command's code, so COMPLETED is a
+                # success whose exit_code the login node cannot see yet (NFS
+                # negative lookup caching). Not for a step: sacct -X
+                # describes its allocation.
+                if final_state != "COMPLETED" or "step" in (
+                    handle.extra or {}
+                ):
+                    horus_logger.log.error(
+                        _(
+                            "The job vanished from queue without writing an "
+                            "exit code (%(state)s)."
+                        )
+                        % {"state": final_state}
+                    )
+                    return 1
+                code = code or 0
+            await self._record_exit_code(code)
+            return code
 
         return None
 
@@ -1713,7 +1723,11 @@ class SlurmTarget(BaseTarget):
 
         # Subshell so a top-level `exit` in cmd still reaches the write --
         # same reasoning as build_detach_command's `( inner ); echo $? > ...`.
-        lines.append(f"( {cmd} ); echo $? > {shlex.quote(job_dir)}/exit_code")
+        # Exit with its code too, so sacct can stand in for exit_code.
+        exit_path = shlex.quote(f"{job_dir}/exit_code")
+        lines.append(
+            f"( {cmd} ); code=$?; echo $code > {exit_path}; exit $code"
+        )
         return lines
 
     async def _read_log(self, path: str) -> bytes:
@@ -1884,10 +1898,10 @@ class SlurmTarget(BaseTarget):
 
     async def _final_state(
         self, handle: JobHandle
-    ) -> tuple[str, str | None] | None:
+    ) -> tuple[str, str | None, int | None] | None:
         """
-        How ``sacct`` says the job ended (``CANCELLED``, ``TIMEOUT``, …), and
-        its recorded reason, if any.
+        How ``sacct`` says the job ended (``CANCELLED``, ``TIMEOUT``, …), its
+        recorded reason, if any, and its exit code, if parsable.
 
         ``None`` when accounting cannot answer: a nonzero exit (no slurmdbd)
         or nothing recorded yet. ``sacct`` appends who cancelled a job
@@ -1903,12 +1917,18 @@ class SlurmTarget(BaseTarget):
         lines = out.decode(errors="replace").strip().splitlines()
         if not lines:
             return None
-        state, _code, reason = [*lines[0].split("|"), "", ""][:3]
+        state, code, reason = [*lines[0].split("|"), "", ""][:3]
         words = state.split()
         if not words:
             return None
         reason = reason.strip()
-        return words[0], None if reason in ("", "None") else reason
+        # ExitCode is "<code>:<signal>".
+        code = code.partition(":")[0].strip()
+        return (
+            words[0],
+            None if reason in ("", "None") else reason,
+            int(code) if code.isdigit() else None,
+        )
 
 
 # --- Known limitations / next steps -----------------------------------------
