@@ -3,6 +3,7 @@
 name: horus-slurm-itest
 
 x-slurm: &slurm
+  # 26.05.2
   image: giovtorres/slurm-docker-cluster@sha256:8b92cbd3bf7e51f910c7266c1dac13cf0c59059fa8db3c385bec76952a79b47b
   volumes:
     - ./slurm.conf:/etc/slurm/slurm.conf:ro
@@ -11,6 +12,7 @@ x-slurm: &slurm
 
 services:
   mysql:
+    # 11.4.13
     image: mariadb@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
     hostname: mysql
     environment:
@@ -39,6 +41,7 @@ services:
     hostname: c1
     # slurmd 26.05 starts the cgroup plugin even with linuxproc and fails
     # on a read-only /sys/fs/cgroup otherwise.
+    # Privileged: for disposable hosted runners only, never self-hosted.
     privileged: true
     init: true
     command:
