@@ -362,3 +362,7 @@ parallel with WP2.
 - **Q3. Privileged workers (F3).** Accept `privileged: true` on `c1`/`c2` in
   CI? *Recommended: yes*; it matches upstream and only runs on a throwaway
   runner. The alternative is sind.
+
+## User decisions
+
+- Approved 2026-10-17 with the recommended answers: Q1 add feat/shared-allocation to the CI pull_request branches; Q2 keep 143 as the contract, strict xfail until the Robustness branch fixes the launcher (coordinator sent F1 to that team: the launcher records 143 whenever the cancel mark exists after srun ends); Q3 privileged workers in CI accepted.
