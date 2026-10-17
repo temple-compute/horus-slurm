@@ -660,7 +660,7 @@ class TestQueueCache:
     ) -> None:
         """The fake reuses job ids: a stale "" must not fail new tasks."""
         inner.responds(squeue=GONE)
-        target = _shared(inner, exit_code_retries=0)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
         handle = await _launch(target, tmp_path, "a")
         assert await target.poll(handle) == 1
 
@@ -676,7 +676,7 @@ class TestQueueCache:
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """Polls leave the job id, so the run-end release cleans it up."""
-        target = _shared(inner, exit_code_retries=0)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
         old = target.idle_copy()
         old_handle = await _launch(old, tmp_path, "a")
         inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
@@ -699,7 +699,7 @@ class TestQueueCache:
     ) -> None:
         """Still listed until MinJobAge: fail and resubmit."""
         inner.responds(squeue=FakeProcess(stdout=b"CANCELLED|None|cpu\n"))
-        target = _shared(inner, exit_code_retries=0)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
         handle = await _launch(target, tmp_path, "a")
         assert await target.poll(handle) == 1
         await _launch(target.idle_copy(), tmp_path, "b")
@@ -709,7 +709,7 @@ class TestQueueCache:
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """A task of an ended allocation does not evict its successor's."""
-        target = _shared(inner, exit_code_retries=0)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
         old = target.idle_copy()
         old_handle = await _launch(old, tmp_path, "a")
         inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
@@ -788,6 +788,147 @@ class TestQueueCache:
             await target._queue_state(handle)
             await target._queue_state(handle)
         assert _squeues(inner) == 4
+
+
+def _ended(inner: FakeInner) -> None:
+    """The allocation left the queue; the next sbatch gets a new id."""
+    inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
+
+
+@pytest.mark.unit
+class TestOrphanMove:
+    """A step its ended allocation never started moves to a new one."""
+
+    async def test_an_unclaimed_step_moves_and_completes(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rebuilt for the new dir, with no exit-code wait."""
+
+        async def no_wait(*_args: Any) -> None:
+            raise AssertionError("waited for an exit code")
+
+        monkeypatch.setattr(SlurmTarget, "_retry_exit_code", no_wait)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        _ended(inner)
+        assert await target.poll(handle) is None
+
+        assert len(inner.commands_starting("sbatch")) == 2
+        old, new = _alloc_dirs(tmp_path)
+        assert handle.extra is not None
+        step = handle.extra["step"]
+        assert handle.extra == {
+            "step": step,
+            "alloc_dir": str(new),
+            "job_id": "23456",
+            "raw_job_id": "23456",
+            "moves": "1",
+        }
+        (launcher,) = _spooled(tmp_path)
+        assert launcher == new / "spool" / f"{step}.sh"
+        assert f"{new}/run/{step}.job" in launcher.read_text()
+        assert f"{new}/run/{step}.cancel" in launcher.read_text()
+        assert str(old) not in launcher.read_text()
+        assert target._record is not None
+        assert target._record.job_id == "23456"
+        assert target._record.script_path == f"{new}/run/{step}.job"
+
+        inner.responds(squeue=RUNNING)
+        (tmp_path / "a" / "exit_code").write_text("0\n")
+        assert await target.poll(handle) == 0
+
+    async def test_copies_that_see_it_together_share_one_sbatch(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The first submits; the others move into its allocation."""
+        old, new = "squeue -h -j 12345", "squeue -h -j 23456"
+        inner.responds(**{old: RUNNING})
+        members = await _members(_shared(inner), tmp_path, 2)
+        _expire(members[0][0])
+        inner.responds(
+            **{old: GONE, new: RUNNING},
+            sbatch=FakeProcess(stdout=b"23456\n"),
+        )
+        results = await asyncio.gather(*(m.poll(h) for m, h in members))
+        assert results == [None, None]
+        assert len(inner.commands_starting("sbatch")) == 2
+        for _m, handle in members:
+            assert handle.extra is not None
+            assert handle.extra["job_id"] == "23456"
+        assert len(_spooled(tmp_path)) == 2
+
+    async def test_a_claimed_step_fails(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The pilot took it: it may have run, so it is not run again."""
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        (launcher,) = _spooled(tmp_path)
+        launcher.rename(launcher.parent.parent / "run" / launcher.name)
+        _ended(inner)
+        assert await target.poll(handle) == 1
+        assert len(inner.commands_starting("sbatch")) == 1
+
+    async def test_a_cancel_during_the_move_reaches_the_new_dir(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cancel hit the old dir after the take-back."""
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        allocation = SlurmTarget._allocation
+
+        async def cancelled(self: SlurmTarget) -> Any:
+            await self.send_signal(handle, signal_mod.SIGTERM)
+            return await allocation(self)
+
+        monkeypatch.setattr(SlurmTarget, "_allocation", cancelled)
+        _ended(inner)
+        assert await target.poll(handle) is None
+        assert _spooled(tmp_path) == []
+        new = _alloc_dirs(tmp_path)[1]
+        assert list(new.glob("run/*.cancel"))
+        assert await target.poll(handle) == 143
+
+    async def test_a_cancel_after_the_move_reaches_the_new_dir(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The handle points at the new allocation."""
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        _ended(inner)
+        assert await target.poll(handle) is None
+        await target.send_signal(handle, signal_mod.SIGTERM)
+        old, new = _alloc_dirs(tmp_path)
+        assert not list(old.glob("run/*.cancel"))
+        assert list(new.glob("run/*.cancel"))
+        assert _spooled(tmp_path) == []
+
+    async def test_a_step_out_of_moves_fails(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """No bouncing between allocations that never start."""
+        target = _shared(inner, exit_code_retries=0, max_step_moves=1)
+        handle = await _launch(target, tmp_path, "a")
+        _ended(inner)
+        assert await target.poll(handle) is None
+        assert await target.poll(handle) == 1
+        assert len(inner.commands_starting("sbatch")) == 2
+
+    async def test_a_failed_sbatch_fails_the_step(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """As without the move; poll does not raise."""
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        inner.responds(squeue=GONE, sbatch=FAILED)
+        assert await target.poll(handle) == 1
+
+    async def test_an_inline_job_is_not_moved(self, inner: FakeInner) -> None:
+        """It has no step to move."""
+        target = SlurmTarget(inner=inner)
+        handle = JobHandle(pid=None, job_dir="", extra={"job_id": "1"})
+        assert not await target._requeue_step(handle)
+        assert inner.commands == []
 
 
 @pytest.mark.unit
