@@ -2,7 +2,7 @@ name: Python CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/shared-allocation]
 
 jobs:
   lint:
@@ -65,4 +65,51 @@ jobs:
         with:
           name: coverage-html-report
           path: htmlcov/
+          retention-days: 5
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Configure git for private repos
+        run: git config --global url."https://${{ secrets.ACTIONS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Sync project dependencies
+        run: uv sync --group dev
+
+      # runner.temp is not available in job-level env
+      - name: Set integration dir
+        run: echo "ITEST_DIR=$RUNNER_TEMP/itest" >> "$GITHUB_ENV"
+
+      - name: Run integration tests
+        run: uv run make integration
+
+      - name: Dump cluster logs
+        if: failure()
+        run: |
+          docker compose -p horus-slurm-itest -f tests/integration/cluster/compose.yaml logs || true
+          find "$ITEST_DIR" -name pilot.log -print -exec cat {} + || true
+
+      - name: Tear down cluster
+        if: always()
+        run: make integration-down
+
+      - name: Upload integration results
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: integration-results
+          path: integration-results.xml
           retention-days: 5
