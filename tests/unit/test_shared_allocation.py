@@ -474,7 +474,7 @@ class TestQueueCache:
     async def test_an_ended_state_is_gone(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """squeue still lists it until MinJobAge: fail and resubmit."""
+        """Still listed until MinJobAge: fail and resubmit."""
         inner.responds(squeue=FakeProcess(stdout=b"CANCELLED|None|cpu\n"))
         target = _shared(inner, exit_code_retries=0)
         handle = await _launch(target, tmp_path, "a")
@@ -586,9 +586,10 @@ class TestSettings:
     def test_out_of_bounds_is_refused(
         self, inner: FakeInner, field: str, value: float
     ) -> None:
-        """Faster polls load the login node; slower checks outlive MinJobAge."""
+        """Faster polls load the login node; slower ones outlive MinJobAge."""
+        fields: dict[str, Any] = {field: value}
         with pytest.raises(ValueError):
-            SlurmTarget(inner=inner, **{field: value})
+            SlurmTarget(inner=inner, **fields)
 
     def test_the_schema_exposes_both(self) -> None:
         """So the target form shows them."""

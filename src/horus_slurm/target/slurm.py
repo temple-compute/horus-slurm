@@ -1377,8 +1377,10 @@ class SlurmTarget(BaseTarget):
             if cached is not None:
                 return cached
             failed = alloc.queue_failed
-            if failed is not None and failed[0] == job_id and (
-                failed[1] >= waited_from
+            if (
+                failed is not None
+                and failed[0] == job_id
+                and failed[1] >= waited_from
             ):
                 return None
             queue = await self._read_queue(handle)
