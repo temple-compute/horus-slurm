@@ -40,7 +40,13 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
 from pydantic import Field, PrivateAttr
 
-from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
+from horus_slurm.events import (
+    CANCELLING,
+    GONE,
+    SUBMITTED,
+    SlurmAllocationEvent,
+    SlurmJobEvent,
+)
 from horus_slurm.i18n import tr as _
 from horus_slurm.record import (
     RECORD_FILE,
@@ -151,6 +157,9 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Tasks bound to this generation, and the last generation seen running.
+    members: set[str] = field(default_factory=set)
+    ready_generation: int = 0
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _Allocation:
         """A deep copy is a separate declared target: no allocation yet."""
@@ -594,6 +603,42 @@ class SlurmTarget(BaseTarget):
                 # Registered per run; a re-run registers its own.
                 handle.ready_callbacks.clear()
 
+    def emit_node_phase(self, phase: str, **fields: Any) -> None:
+        """Publish a lease phase of the shared allocation. Never raises."""
+        del fields
+        alloc = self._alloc
+        # Until the pilot runs, a holding or busy would hide "queued".
+        if (
+            phase in ("busy", "holding")
+            and alloc.ready_generation != alloc.generation
+        ):
+            return
+        self._emit_allocation(phase)
+
+    def _emit_allocation(self, phase: str, reason: str | None = None) -> None:
+        """Publish the allocation's *phase* on the bus. Never raises."""
+        if not self.releasable:
+            return
+        alloc = self._alloc
+        try:
+            HorusContext.get_context().bus.emit(
+                SlurmAllocationEvent(
+                    phase=phase,  # type: ignore[arg-type]
+                    task_id=self._task.id if self._task is not None else "",
+                    node_key=self.lease_key,
+                    target_ref=self._ref,
+                    generation=alloc.generation,
+                    member_task_ids=sorted(alloc.members),
+                    job_id=alloc.job_id,
+                    reason=reason,
+                )
+            )
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not announce the allocation phase: %(err)s")
+                % {"err": exc}
+            )
+
     async def keepalive(self) -> None:
         """
         Prove the orchestrator still wants the allocation: an idle pilot
@@ -631,19 +676,28 @@ class SlurmTarget(BaseTarget):
                     handle.job_id = None
             if handle.job_id is None:
                 handle.generation += 1
+                handle.members = set()
+            if self._task is not None:
+                handle.members.add(self._task.id)
+            if handle.job_id is None:
                 alloc_dir = (
                     f"{self.resolved_working_directory}/{ALLOC_DIR}/"
                     f"{self.lease_key}-{handle.generation}"
                 )
-                await self._make_private_dir(alloc_dir)
-                script_path = f"{alloc_dir}/pilot.sh"
-                await self.inner.put_file(
-                    self._pilot_script(alloc_dir).encode(), script_path
-                )
-                handle.job_id, _raw = await self._sbatch(script_path)
+                try:
+                    await self._make_private_dir(alloc_dir)
+                    script_path = f"{alloc_dir}/pilot.sh"
+                    await self.inner.put_file(
+                        self._pilot_script(alloc_dir).encode(), script_path
+                    )
+                    handle.job_id, _raw = await self._sbatch(script_path)
+                except Exception as exc:
+                    self._emit_allocation("failed", reason=str(exc))
+                    raise
                 handle.alloc_dir = alloc_dir
                 handle.callbacks_done = asyncio.Event()
                 submitted = True
+                self._emit_allocation("queued")
             done = handle.callbacks_done
         if submitted:
             # Outside the lock: a long restore must not hold up a release.
