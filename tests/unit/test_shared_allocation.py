@@ -26,6 +26,7 @@ from horus_runtime.event.base import BaseEvent
 from pydantic import ValidationError
 
 from horus_slurm.events import SlurmAllocationEvent, SlurmJobEvent
+from horus_slurm.record import STDERR_FILE, STDOUT_FILE
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
@@ -1141,6 +1142,21 @@ class TestScripts:
         env = self._bin(tmp_path, 'exec bash "${@: -1}"')
         subprocess.run(["bash", str(launcher)], check=True, env=env)
         assert self._exit_code(tmp_path) == "3"
+
+    async def test_output_is_written_before_the_exit_code(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The step writes its own logs, so poll never sees them empty."""
+        _t, _h, launcher = await self._launched(
+            inner, tmp_path, "echo out; echo err >&2"
+        )
+        assert "--output" not in launcher.read_text()
+        env = self._bin(tmp_path, 'exec bash "${@: -1}"')
+        subprocess.run(["bash", str(launcher)], check=True, env=env)
+        side = tmp_path / "a" / "side-artifacts"
+        assert self._exit_code(tmp_path) == "0"
+        assert (side / STDOUT_FILE).read_text() == "out\n"
+        assert (side / STDERR_FILE).read_text() == "err\n"
 
     async def test_a_failed_srun_still_leaves_an_exit_code(
         self, inner: FakeInner, tmp_path: Path
