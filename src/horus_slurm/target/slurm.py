@@ -40,7 +40,13 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
 from pydantic import Field, PrivateAttr, field_validator
 
-from horus_slurm.events import CANCELLING, GONE, SUBMITTED, SlurmJobEvent
+from horus_slurm.events import (
+    CANCELLING,
+    GONE,
+    SUBMITTED,
+    SlurmAllocationEvent,
+    SlurmJobEvent,
+)
 from horus_slurm.i18n import tr as _
 from horus_slurm.record import (
     RECORD_FILE,
@@ -189,6 +195,11 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Tasks bound to this generation, and the last generation seen running
+    # and announced released.
+    members: set[str] = field(default_factory=set)
+    ready_generation: int = 0
+    released_generation: int = 0
     # Set by the run-end release so a step moving late cannot submit a
     # pilot nobody cancels; the next run's first launch clears it.
     closed: bool = False
@@ -715,6 +726,7 @@ class SlurmTarget(BaseTarget):
                     raise TaskExecutionError(
                         _("scancel failed: %(error)s") % {"error": error}
                     )
+                self._emit_allocation("released", reason=reason)
                 handle.job_id = None
                 # The launchers and job scripts; pilot.log stays.
                 alloc = shlex.quote(handle.alloc_dir)
@@ -726,6 +738,56 @@ class SlurmTarget(BaseTarget):
                 # Registered per run; a re-run registers its own.
                 handle.ready_callbacks.clear()
                 handle.closed = True
+
+    def emit_node_phase(self, phase: str, **fields: Any) -> None:
+        """Publish a lease phase of the shared allocation. Never raises."""
+        del fields
+        alloc = self._alloc
+        # Nothing follows released in a generation; the next queued bumps it.
+        if alloc.released_generation == alloc.generation:
+            return
+        # Until the pilot runs, a holding or busy would hide "queued".
+        if (
+            phase in ("busy", "holding")
+            and alloc.ready_generation != alloc.generation
+        ):
+            return
+        self._emit_allocation(phase)
+
+    def _emit_allocation(self, phase: str, reason: str | None = None) -> None:
+        """Publish the allocation's *phase* on the bus. Never raises."""
+        if not self.releasable:
+            return
+        alloc = self._alloc
+        # Once per generation each, whichever copy sees it first.
+        if phase == "ready":
+            if alloc.ready_generation == alloc.generation:
+                return
+            alloc.ready_generation = alloc.generation
+        elif phase == "released":
+            if alloc.released_generation == alloc.generation:
+                return
+            alloc.released_generation = alloc.generation
+        # A lease copy can still hold a task from an earlier generation.
+        task_id = self._task.id if self._task is not None else ""
+        try:
+            HorusContext.get_context().bus.emit(
+                SlurmAllocationEvent(
+                    phase=phase,  # type: ignore[arg-type]
+                    task_id=task_id if task_id in alloc.members else "",
+                    node_key=self.lease_key,
+                    target_ref=self._ref,
+                    generation=alloc.generation,
+                    member_task_ids=sorted(alloc.members),
+                    job_id=alloc.job_id,
+                    reason=reason,
+                )
+            )
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not announce the allocation phase: %(err)s")
+                % {"err": exc}
+            )
 
     async def keepalive(self) -> None:
         """
@@ -768,22 +830,31 @@ class SlurmTarget(BaseTarget):
                         _("The allocation was released for this run.")
                     )
                 handle.generation += 1
+                handle.members = set()
                 handle.queue_job_id = handle.queue = None
                 handle._partition_checked = None  # noqa: SLF001
                 handle._partition_nodes = None  # noqa: SLF001
+            if self._task is not None:
+                handle.members.add(self._task.id)
+            if handle.job_id is None:
                 root = f"{self.resolved_working_directory}/{ALLOC_DIR}"
                 alloc_dir = (
                     f"{root}/{self._ref}.{self.lease_key}-{handle.generation}"
                 )
-                await self._make_private_dir(alloc_dir)
-                script_path = f"{alloc_dir}/pilot.sh"
-                await self.inner.put_file(
-                    self._pilot_script(alloc_dir).encode(), script_path
-                )
-                handle.job_id, _raw = await self._sbatch(script_path)
+                try:
+                    await self._make_private_dir(alloc_dir)
+                    script_path = f"{alloc_dir}/pilot.sh"
+                    await self.inner.put_file(
+                        self._pilot_script(alloc_dir).encode(), script_path
+                    )
+                    handle.job_id, _raw = await self._sbatch(script_path)
+                except Exception as exc:
+                    self._emit_allocation("failed", reason=str(exc))
+                    raise
                 handle.alloc_dir = alloc_dir
                 handle.callbacks_done = asyncio.Event()
                 submitted = True
+                self._emit_allocation("queued")
             done = handle.callbacks_done
         if submitted:
             # Outside the lock: a long restore must not hold up a release.
@@ -1223,6 +1294,11 @@ class SlurmTarget(BaseTarget):
         # between two polls would otherwise never report having run.
         queue = await self._queue_state(handle)
         gone = queue is not None and queue.gone
+        if queue is not None and job_id == self._alloc.job_id:
+            if queue.state == "RUNNING":
+                self._emit_allocation("ready")
+            elif gone:
+                self._emit_allocation("released", reason="gone")
         if queue is not None and queue.state:
             await self._announce(
                 job_id,
@@ -1235,6 +1311,9 @@ class SlurmTarget(BaseTarget):
         if await self.inner.path_exists(exit_code_path):
             raw = await self.inner.get_file(exit_code_path)
             exit_code = int(raw.decode().strip())
+            # The pilot ran, even if the cached reading still says pending.
+            if job_id == self._alloc.job_id and not gone:
+                self._emit_allocation("ready")
             await self._record_exit_code(exit_code)
             return exit_code
 

@@ -22,8 +22,10 @@ from horus_runtime.context import HorusContext
 from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.event.base import BaseEvent
+from pydantic import ValidationError
 
-from horus_slurm.events import SlurmJobEvent
+from horus_slurm.events import SlurmAllocationEvent, SlurmJobEvent
 from horus_slurm.record import STDERR_FILE, STDOUT_FILE
 from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
@@ -592,7 +594,11 @@ class TestQueueCache:
         for member, _h in members:
             assert member._record is not None
             assert member._record.state == "RUNNING"
-        running = [e.task_id for e in events if e.state == "RUNNING"]
+        running = [
+            e.task_id
+            for e in events
+            if isinstance(e, SlurmJobEvent) and e.state == "RUNNING"
+        ]
         assert sorted(running) == sorted(f"t{i}" for i in range(50))
 
     async def test_a_failed_read_is_not_cached(
@@ -1233,3 +1239,336 @@ class TestValidation:
         target = _shared(inner, mem="0")
         task = _Task(str(tmp_path), ResourceRequest(memory_gb=64))
         assert target.validate_member(task) == []  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+class TestAllocationEventModel:
+    """The wire shape a host reads, like a terraform node event."""
+
+    def test_round_trip(self) -> None:
+        """Every field a host reads is in the dump."""
+        event = SlurmAllocationEvent(
+            phase="queued",
+            task_id="a",
+            node_key="k",
+            target_ref="hpc",
+            generation=1,
+            member_task_ids=["a"],
+            job_id="12345",
+        )
+        data = event.model_dump(mode="json")
+        assert data["event_type"] == "slurm_allocation_event"
+        assert {
+            k: data[k]
+            for k in (
+                "phase",
+                "task_id",
+                "node_key",
+                "target_ref",
+                "generation",
+                "member_task_ids",
+                "job_id",
+                "reason",
+            )
+        } == {
+            "phase": "queued",
+            "task_id": "a",
+            "node_key": "k",
+            "target_ref": "hpc",
+            "generation": 1,
+            "member_task_ids": ["a"],
+            "job_id": "12345",
+            "reason": None,
+        }
+        assert SlurmAllocationEvent.model_validate(data) == event
+
+    def test_an_unknown_phase_is_refused(self) -> None:
+        """A phase the host does not know never leaves the target."""
+        with pytest.raises(ValidationError):
+            SlurmAllocationEvent(
+                phase="releasing",  # type: ignore[arg-type]
+                task_id="",
+                node_key="k",
+                target_ref="hpc",
+                generation=1,
+                member_task_ids=[],
+            )
+
+
+@pytest.fixture
+def phases(
+    horus_context: HorusContext, monkeypatch: pytest.MonkeyPatch
+) -> list[SlurmAllocationEvent]:
+    """The allocation events published on the bus during a test."""
+    events: list[SlurmAllocationEvent] = []
+
+    def capture(event: BaseEvent) -> None:
+        if isinstance(event, SlurmAllocationEvent):
+            events.append(event)
+
+    monkeypatch.setattr(horus_context.bus, "emit", capture)
+    return events
+
+
+@pytest.mark.unit
+class TestAllocationEvents:
+    """What a shared target tells a host about its allocation."""
+
+    async def test_a_submit_is_queued_once(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The first member submits and is bound; the second joins."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await _launch(target.idle_copy(), tmp_path, "b")
+
+        assert [e.phase for e in phases] == ["queued"]
+        queued = phases[0]
+        assert queued.generation == 1
+        assert queued.job_id == "12345"
+        assert queued.node_key == target.lease_key
+        assert queued.target_ref == "hpc"
+        assert queued.member_task_ids == ["a"]
+        assert target._alloc.members == {"a", "b"}
+
+    async def test_a_new_generation_resets_the_members(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """An allocation that left the queue is replaced, with new members."""
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await _launch(target, tmp_path, "b")  # squeue: gone
+
+        assert [(e.phase, e.generation) for e in phases] == [
+            ("queued", 1),
+            ("queued", 2),
+        ]
+        assert phases[1].member_task_ids == ["b"]
+
+    async def test_a_failed_submit_is_announced(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The caller still gets the error."""
+        inner.responds(
+            sbatch=FakeProcess(stderr=b"no partition", returncode=1)
+        )
+        with pytest.raises(TaskExecutionError, match="no partition"):
+            await _launch(_shared(inner), tmp_path, "a")
+
+        assert [e.phase for e in phases] == ["failed"]
+        assert phases[0].reason is not None
+        assert "no partition" in phases[0].reason
+        assert phases[0].job_id is None
+
+    async def test_lease_phases_wait_for_ready(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """A pending pilot is not holding or busy yet; draining always is."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        phases.clear()
+
+        for phase in ("holding", "busy", "draining", "drain_failed"):
+            target.emit_node_phase(phase, outputs=1)
+        assert [e.phase for e in phases] == ["draining", "drain_failed"]
+
+        phases.clear()
+        target._alloc.ready_generation = target.generation
+        target.emit_node_phase("holding")
+        target.emit_node_phase("busy")
+        assert [e.phase for e in phases] == ["holding", "busy"]
+        assert phases[0].member_task_ids == ["a"]
+
+    async def test_a_stale_task_is_not_bound(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """A lease copy's task from an earlier generation is not sent."""
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await _launch(target.idle_copy(), tmp_path, "b")  # squeue: gone
+        target._alloc.ready_generation = target.generation
+        phases.clear()
+
+        target.emit_node_phase("holding")
+        assert phases[0].task_id == ""
+        assert phases[0].member_task_ids == ["b"]
+
+    async def test_a_failing_bus_fails_nothing(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        horus_context: HorusContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Announcing is best effort."""
+
+        def boom(event: BaseEvent) -> None:
+            del event
+            raise RuntimeError("bus down")
+
+        monkeypatch.setattr(horus_context.bus, "emit", boom)
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        target.emit_node_phase("draining")
+        assert target.is_live
+
+    async def test_an_inline_target_announces_nothing(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """It has no allocation to show."""
+        inner.runs("umask ", "mv ", "touch ", "rm ")
+        target = SlurmTarget(
+            inner=inner, working_directory=inner.working_directory
+        )
+        await _launch(target, tmp_path, "a")
+        target._alloc.ready_generation = target.generation
+        for phase in ("holding", "busy", "draining"):
+            target.emit_node_phase(phase)
+        assert phases == []
+
+    async def test_ready_once_per_generation(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The first running poll; then holding and busy pass."""
+        inner.responds(squeue=FakeProcess(stdout=b"PENDING|(Resources)|cpu\n"))
+        target = _shared(inner)
+        (a, ha), (b, hb) = await _members(target, tmp_path, 2)
+        await a.poll(ha)
+        a.emit_node_phase("holding")
+        assert [e.phase for e in phases] == ["queued"]
+
+        inner.responds(squeue=RUNNING)
+        _expire(target)
+        await a.poll(ha)
+        await b.poll(hb)
+        a.emit_node_phase("holding")
+        assert [e.phase for e in phases] == ["queued", "ready", "holding"]
+        assert phases[1].member_task_ids == ["t0", "t1"]
+
+        await target.release("done")
+        await _launch(target.idle_copy(), tmp_path, "c")
+        handle = await _launch(target.idle_copy(), tmp_path, "d")
+        _expire(target)
+        await target.poll(handle)
+        assert [(e.phase, e.generation) for e in phases[-2:]] == [
+            ("queued", 2),
+            ("ready", 2),
+        ]
+
+    async def test_a_gone_allocation_is_released_once(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The run-end release after it sends nothing more."""
+        inner.responds(squeue=RUNNING)
+        # Spooled steps would move on; this is about the gone allocation.
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
+        (a, ha), (b, hb) = await _members(target, tmp_path, 2)
+        inner.responds(squeue=GONE)
+        _expire(target)
+        assert await a.poll(ha) == 1
+        assert await b.poll(hb) == 1
+        await target.release("run_end")
+
+        assert [e.phase for e in phases] == ["queued", "released"]
+        assert phases[1].reason == "gone"
+        assert phases[1].job_id == "12345"
+
+    async def test_nothing_follows_a_gone_release(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The lease phases after it do not re-open the card."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        inner.responds(squeue=GONE)
+        _expire(target)
+        assert await target.poll(handle) == 1
+        target.emit_node_phase("holding")
+        target.emit_node_phase("draining")
+        await target.release("run_end")
+
+        assert [e.phase for e in phases] == ["queued", "ready", "released"]
+
+    async def test_a_short_member_is_ready_on_exit_code(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """It finished while the cached reading still said pending."""
+        inner.responds(squeue=FakeProcess(stdout=b"PENDING|(Resources)|cpu\n"))
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        (tmp_path / "a" / "exit_code").write_text("0\n")
+        assert await target.poll(handle) == 0
+        target.emit_node_phase("holding")
+
+        assert [e.phase for e in phases] == ["queued", "ready", "holding"]
+
+    async def test_release_is_announced_once(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """With the cancelled job id."""
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await target.release("done")
+        await target.release("done")
+
+        assert [e.phase for e in phases] == ["queued", "released"]
+        assert phases[1].reason == "done"
+        assert phases[1].job_id == "12345"
+
+    async def test_a_failing_bus_fails_no_poll_or_release(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        horus_context: HorusContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ready and released are best effort too."""
+
+        def boom(event: BaseEvent) -> None:
+            del event
+            raise RuntimeError("bus down")
+
+        monkeypatch.setattr(horus_context.bus, "emit", boom)
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "a")
+        assert await target.poll(handle) is None
+        await target.release("done")
+        assert not target.is_live
