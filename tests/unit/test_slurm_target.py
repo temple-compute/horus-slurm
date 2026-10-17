@@ -647,6 +647,65 @@ class TestPolling:
 
         assert await target.poll(handle) == 1
 
+    @pytest.mark.parametrize(
+        ("sacct", "expected"),
+        [
+            (b"COMPLETED|0:0|None\n", 0),
+            (b"COMPLETED||None\n", 0),
+            (b"FAILED|2:0|NonZeroExitCode\n", 1),
+            (b"TIMEOUT|0:0|None\n", 1),
+        ],
+    )
+    async def test_vanished_without_a_visible_exit_code_trusts_sacct(
+        self, tmp_path: Path, sacct: bytes, expected: int
+    ) -> None:
+        """
+        A shared filesystem can hide a written exit_code from the login node
+        for a while; a job accounted COMPLETED still succeeded.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=sacct),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+
+        assert await target.poll(handle) == expected
+        assert _read_record(task).exit_code == (
+            expected if expected == 0 else None
+        )
+
+    async def test_a_vanished_step_does_not_trust_its_allocation(
+        self, tmp_path: Path
+    ) -> None:
+        """Accounting for the allocation says nothing about one step."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"COMPLETED|0:0|None\n"),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None,
+            job_dir=str(tmp_path),
+            extra={"job_id": "12345", "step": "horus-a", "alloc_dir": "x"},
+        )
+
+        assert await target.poll(handle) == 1
+
+    async def test_the_script_exits_with_the_command_code(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """So sacct accounts a failed command as FAILED, not COMPLETED."""
+        script = _target(inner)._build_sbatch_script(
+            "run me", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        assert script.rstrip().endswith("; exit $code")
+
     async def test_exit_code_written_late_is_still_honoured(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
