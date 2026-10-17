@@ -52,6 +52,46 @@ def to_slurm_time(value: str | None) -> str | None:
     return f"{days}-{clock}" if days else clock
 
 
+def slurm_seconds(value: str | None) -> int | None:
+    """
+    Seconds in a Slurm time (``MM``, ``MM:SS``, ``HH:MM:SS``,
+    ``D-HH[:MM[:SS]]``) or a suffixed duration; ``None`` when unreadable.
+    """
+    text = to_slurm_time(value)
+    if not text:
+        return None
+    days, _sep, clock = text.strip().rpartition("-")
+    try:
+        parts = [int(p) for p in clock.split(":")]
+        day_count = int(days) if days else 0
+    except ValueError:
+        return None
+    if days:
+        parts = [*parts, 0, 0][:3]  # HH[:MM[:SS]] after a day count
+    elif len(parts) == 1:
+        parts = [0, parts[0], 0]  # bare minutes
+    else:
+        parts = [0, 0, *parts][-3:]
+    hours, minutes, seconds = parts
+    return ((day_count * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+_MEM_MB = {"k": 1 / 1024, "m": 1, "g": 1024, "t": 1024 * 1024}
+"""Megabytes per unit of a Slurm memory size; a bare number is megabytes."""
+
+
+def slurm_mem_mb(value: str | None) -> int | None:
+    """Megabytes in a Slurm memory size (``4G``, ``512M``, ``2048``)."""
+    if not value:
+        return None
+    text = value.strip().lower().removesuffix("b")
+    unit = _MEM_MB.get(text[-1:])
+    try:
+        return int(float(text[:-1] if unit else text) * (unit or 1))
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class SlurmJobScope(ResourceScope):
     """
