@@ -82,6 +82,23 @@ job waits on hardware, and whether that hardware is busy, drained or down is
 what the user needs to know next.
 """
 
+ENDED_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "TIMEOUT",
+    }
+)
+"""
+States ``squeue`` may still list an ended job in until ``MinJobAge`` passes.
+"""
+
 PARTITION_SUMMARY_INTERVAL = 60.0
 """Seconds between ``sinfo`` reads while the pending reason is unchanged."""
 
@@ -93,6 +110,11 @@ class QueueState(NamedTuple):
     reason: str | None = None
     nodes: str | None = None
     partition: str | None = None
+
+    @property
+    def gone(self) -> bool:
+        """Whether the job has left the queue or ended."""
+        return self.state == "" or self.state in ENDED_STATES
 
 
 ALLOC_DIR = ".horus_alloc"
@@ -662,7 +684,7 @@ class SlurmTarget(BaseTarget):
                         pid=None, job_dir="", extra={"job_id": handle.job_id}
                     )
                 )
-                if queue is not None and queue.state == "":
+                if queue is not None and queue.gone:
                     handle.job_id = None
             if handle.job_id is None:
                 handle.generation += 1
@@ -1021,7 +1043,7 @@ class SlurmTarget(BaseTarget):
         # Announce before the exit_code short-circuit: a job that finishes
         # between two polls would otherwise never report having run.
         queue = await self._queue_state(handle)
-        state = queue.state if queue is not None else None
+        gone = queue is not None and queue.gone
         if queue is not None and queue.state:
             await self._announce(
                 job_id,
@@ -1037,21 +1059,16 @@ class SlurmTarget(BaseTarget):
             await self._record_exit_code(exit_code)
             return exit_code
 
-        if state == "" and self._cancelling:
+        if gone and self._cancelling:
             # A cancelled job never writes exit_code, so waiting for one only
             # outlasts the caller's grace period and loses the final record.
             final = await self._final_state(handle)
             await self._announce(job_id, *(final or ("CANCELLED", None)))
             return 1
 
-        if state == "" and self.releasable:
-            # Only if still current: _allocation may have resubmitted.
-            alloc = self._alloc
-            async with alloc.lock:
-                if alloc.job_id == job_id:
-                    alloc.job_id = None
-
-        if state == "":
+        # A shared allocation's job id stays set: the run-end release still
+        # cleans it up, and the next launch sees it gone and resubmits.
+        if gone:
             # Left the queue without exit_code visible yet. This can be a race:
             # Slurm sometimes flushes exit_code a few seconds after the job
             # disappears from squeue. Retry briefly before concluding it was

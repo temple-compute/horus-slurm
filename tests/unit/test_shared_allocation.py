@@ -414,7 +414,6 @@ class TestQueueCache:
         target = _shared(inner, exit_code_retries=0)
         handle = await _launch(target, tmp_path, "a")
         assert await target.poll(handle) == 1
-        assert not target.is_live
 
         inner.responds(squeue=RUNNING)
         member = target.idle_copy()
@@ -424,10 +423,10 @@ class TestQueueCache:
         assert await member.poll(new) is None
         assert _squeues(inner) == before + 1
 
-    async def test_only_the_current_allocation_is_cleared(
+    async def test_an_ended_allocation_is_kept_for_release(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """A task of an ended allocation leaves its successor alone."""
+        """Polls leave the job id, so the run-end release cleans it up."""
         target = _shared(inner, exit_code_retries=0)
         old = target.idle_copy()
         old_handle = await _launch(old, tmp_path, "a")
@@ -437,10 +436,25 @@ class TestQueueCache:
         assert target._alloc.job_id == "23456"
 
         assert await old.poll(old_handle) == 1
-        assert target._alloc.job_id == "23456"
         assert await new.poll(new_handle) == 1
-        assert target._alloc.job_id is None
+        assert target._alloc.job_id == "23456"
+        assert target.is_live
+        assert list((tmp_path / ALLOC_DIR).glob("*-2/spool"))
+
+        await target.release("run_end")
         assert not target.is_live
+        assert not list((tmp_path / ALLOC_DIR).glob("*-2/spool"))
+
+    async def test_an_ended_state_is_gone(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """squeue still lists it until MinJobAge: fail and resubmit."""
+        inner.responds(squeue=FakeProcess(stdout=b"CANCELLED|None|cpu\n"))
+        target = _shared(inner, exit_code_retries=0)
+        handle = await _launch(target, tmp_path, "a")
+        assert await target.poll(handle) == 1
+        await _launch(target.idle_copy(), tmp_path, "b")
+        assert len(inner.commands_starting("sbatch")) == 2
 
     async def test_a_launch_reuses_a_fresh_reading(
         self, inner: FakeInner, tmp_path: Path
