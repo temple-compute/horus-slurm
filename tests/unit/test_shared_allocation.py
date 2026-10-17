@@ -531,9 +531,19 @@ class TestQueueCache:
         assert len(inner.commands_starting("sbatch")) == 2
 
     async def test_fifty_copies_share_one_sinfo(
-        self, inner: FakeInner, tmp_path: Path
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """While pending on nodes, one partition summary for all."""
+        sinfo = SlurmTarget._sinfo
+
+        async def slow(self: SlurmTarget, partition: str | None) -> Any:
+            await asyncio.sleep(0)  # let the herd poll meanwhile
+            return await sinfo(self, partition)
+
+        monkeypatch.setattr(SlurmTarget, "_sinfo", slow)
         inner.responds(
             squeue=FakeProcess(stdout=b"PENDING|(Resources)|gpu\n"),
             sinfo=FakeProcess(stdout=b"idle|0\nmixed|1\n"),

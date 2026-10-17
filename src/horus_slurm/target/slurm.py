@@ -692,6 +692,8 @@ class SlurmTarget(BaseTarget):
             if handle.job_id is None:
                 handle.generation += 1
                 handle.queue_job_id = handle.queue = None
+                handle._partition_checked = None  # noqa: SLF001
+                handle._partition_nodes = None  # noqa: SLF001
                 alloc_dir = (
                     f"{self.resolved_working_directory}/{ALLOC_DIR}/"
                     f"{self.lease_key}-{handle.generation}"
@@ -1446,18 +1448,25 @@ class SlurmTarget(BaseTarget):
             cache._partition_checked = None  # noqa: SLF001
             cache._partition_nodes = None  # noqa: SLF001
             return None
-        now = time.monotonic()
-        checked = cache._partition_checked  # noqa: SLF001
-        if (
-            checked is not None
-            and checked[0] == reason
-            and now - checked[1] < PARTITION_SUMMARY_INTERVAL
-        ):
+
+        def fresh() -> bool:
+            checked = cache._partition_checked  # noqa: SLF001
+            return (
+                checked is not None
+                and checked[0] == reason
+                and time.monotonic() - checked[1] < PARTITION_SUMMARY_INTERVAL
+            )
+
+        if fresh():
             return cache._partition_nodes  # noqa: SLF001
-        cache._partition_checked = (reason, now)  # noqa: SLF001
-        nodes = await self._sinfo(self.partition or queue.partition)
-        cache._partition_nodes = nodes  # noqa: SLF001
-        return nodes
+        # Copies polling meanwhile wait for this read, not the old summary.
+        async with self._alloc.refresh_lock:
+            if fresh():
+                return cache._partition_nodes  # noqa: SLF001
+            nodes = await self._sinfo(self.partition or queue.partition)
+            cache._partition_nodes = nodes  # noqa: SLF001
+            cache._partition_checked = (reason, time.monotonic())  # noqa: SLF001
+            return nodes
 
     async def _sinfo(self, partition: str | None) -> dict[str, int] | None:
         """
