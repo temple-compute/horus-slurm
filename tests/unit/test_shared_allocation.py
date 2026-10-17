@@ -582,6 +582,23 @@ class TestAllocationEvents:
         assert [e.phase for e in phases] == ["holding", "busy"]
         assert phases[0].member_task_ids == ["a"]
 
+    async def test_a_stale_task_is_not_bound(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """A lease copy's task from an earlier generation is not sent."""
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await _launch(target.idle_copy(), tmp_path, "b")  # squeue: gone
+        target._alloc.ready_generation = target.generation
+        phases.clear()
+
+        target.emit_node_phase("holding")
+        assert phases[0].task_id == ""
+        assert phases[0].member_task_ids == ["b"]
+
     async def test_a_failing_bus_fails_nothing(
         self,
         inner: FakeInner,

@@ -620,11 +620,13 @@ class SlurmTarget(BaseTarget):
         if not self.releasable:
             return
         alloc = self._alloc
+        # A lease copy can still hold a task from an earlier generation.
+        task_id = self._task.id if self._task is not None else ""
         try:
             HorusContext.get_context().bus.emit(
                 SlurmAllocationEvent(
                     phase=phase,  # type: ignore[arg-type]
-                    task_id=self._task.id if self._task is not None else "",
+                    task_id=task_id if task_id in alloc.members else "",
                     node_key=self.lease_key,
                     target_ref=self._ref,
                     generation=alloc.generation,
