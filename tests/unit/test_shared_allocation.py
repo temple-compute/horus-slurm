@@ -1334,6 +1334,26 @@ class TestAllocationEvents:
         assert phases[1].reason == "gone"
         assert phases[1].job_id == "12345"
 
+    async def test_nothing_follows_a_gone_release(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        phases: list[SlurmAllocationEvent],
+    ) -> None:
+        """The lease phases after it do not re-open the card."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner, exit_code_retries=0, max_step_moves=0)
+        handle = await _launch(target, tmp_path, "a")
+        await target.poll(handle)
+        inner.responds(squeue=GONE)
+        _expire(target)
+        assert await target.poll(handle) == 1
+        target.emit_node_phase("holding")
+        target.emit_node_phase("draining")
+        await target.release("run_end")
+
+        assert [e.phase for e in phases] == ["queued", "ready", "released"]
+
     async def test_release_is_announced_once(
         self,
         inner: FakeInner,

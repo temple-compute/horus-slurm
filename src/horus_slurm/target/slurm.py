@@ -730,6 +730,9 @@ class SlurmTarget(BaseTarget):
         """Publish a lease phase of the shared allocation. Never raises."""
         del fields
         alloc = self._alloc
+        # Nothing follows released in a generation; the next queued bumps it.
+        if alloc.released_generation == alloc.generation:
+            return
         # Until the pilot runs, a holding or busy would hide "queued".
         if (
             phase in ("busy", "holding")
