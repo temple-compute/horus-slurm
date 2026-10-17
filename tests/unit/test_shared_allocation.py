@@ -531,9 +531,14 @@ class TestScripts:
         old = time.time() - 60
         os.utime(alloc / "heartbeat", (old, old))
         env = self._bin(tmp_path, 'exec bash "${@: -1}"')
+        assert "#SBATCH --no-requeue" in pilot
         subprocess.run(["bash", "-c", pilot], check=True, env=env, timeout=20)
         assert self._exit_code(tmp_path) == "0"
         assert list((alloc / "run").glob("*.sh"))
+        # Spooled after the pilot ended: never claimed, so it can be moved.
+        late = alloc / "spool" / "late.sh"
+        late.write_text("true\n")
+        assert late.exists()
 
 
 @pytest.mark.unit
