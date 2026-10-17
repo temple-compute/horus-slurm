@@ -752,6 +752,13 @@ class SlurmTarget(BaseTarget):
         not run.
         """
         handle = await self._allocation()
+        await self._spool_step(handle, step, script, job_dir)
+        return str(handle.job_id), handle.alloc_dir
+
+    async def _spool_step(
+        self, handle: _Allocation, step: str, script: str, job_dir: str
+    ) -> None:
+        """Write the step script and launcher into handle.alloc_dir/spool."""
         request = self._task.resources if self._task is not None else None
         # The task's own request, not the target's (the allocation's) size.
         step_res = resolve_resources(request)
@@ -801,12 +808,23 @@ class SlurmTarget(BaseTarget):
         proc = await self.inner.run_command_sync(
             f"mv {q(spool + '.tmp')} {q(spool + '.sh')}"
         )
-        if await proc.wait() != 0:
+        if await proc.wait() == 0:
+            return
+        # Over SSH a failed mv may still have run: the step name is the
+        # key, so a launcher found spooled or claimed has landed.
+        try:
+            proc = await self.inner.run_command_sync(
+                f"[ -e {q(spool + '.sh')} ] || [ -e {q(run + '.sh')} ] "
+                f"|| {{ rm -f {q(spool + '.tmp')}; exit 1; }}"
+            )
+            landed = await proc.wait() == 0
+        except Exception:
+            landed = False
+        if not landed:
             raise TaskExecutionError(
                 _("Could not hand the task to allocation %(job_id)s.")
                 % {"job_id": handle.job_id}
             )
-        return str(handle.job_id), handle.alloc_dir
 
     async def _step_id(self, job_id: str, step: str) -> str | None:
         """The id (``<job>.<n>``) of the running step named *step*."""

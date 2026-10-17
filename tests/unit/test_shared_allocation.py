@@ -93,6 +93,32 @@ def _spooled(tmp_path: Path) -> list[Path]:
     return sorted((tmp_path / ALLOC_DIR).glob("*/spool/*.sh"))
 
 
+def _ambiguous_mv(
+    monkeypatch: pytest.MonkeyPatch, inner: FakeInner, then: str
+) -> None:
+    """
+    The launcher's ``mv`` ends with no exit status, as over a dropped SSH
+    connection, after it moved the file (``moved``), the pilot claimed it
+    (``claimed``), or nothing (``lost``); ``broken`` also fails the check.
+    """
+    inner.runs("[ ")
+    run = FakeInner.run_command_sync
+
+    async def spy(self: FakeInner, cmd: str, **kwargs: Any) -> Any:
+        if cmd.startswith("mv ") and "/spool/" in cmd:
+            if then in ("moved", "claimed"):
+                await (await run(self, cmd, **kwargs)).wait()
+            if then == "claimed":
+                (launcher,) = _spooled(Path(self.working_directory or ""))
+                launcher.rename(launcher.parent.parent / "run" / launcher.name)
+            return FakeProcess(returncode=-1)
+        if cmd.startswith("[ ") and then == "broken":
+            raise OSError("connection lost")
+        return await run(self, cmd, **kwargs)
+
+    monkeypatch.setattr(FakeInner, "run_command_sync", spy)
+
+
 @pytest.mark.unit
 class TestSharing:
     """Which targets share an allocation."""
@@ -280,6 +306,40 @@ class TestAllocation:
         os.utime(heartbeat, (0, 0))
         await target.keepalive()
         assert heartbeat.stat().st_mtime > 0
+
+    @pytest.mark.parametrize("then", ["moved", "claimed"])
+    async def test_an_ambiguous_mv_that_landed_succeeds(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        then: str,
+    ) -> None:
+        """The launcher is there: retrying would run the step twice."""
+        _ambiguous_mv(monkeypatch, inner, then)
+        handle = await _launch(_shared(inner), tmp_path, "a")
+        assert handle.extra is not None
+        step = handle.extra["step"]
+        alloc = _alloc_dirs(tmp_path)[0]
+        where = "spool" if then == "moved" else "run"
+        assert (alloc / where / f"{step}.sh").exists()
+
+    @pytest.mark.parametrize("then", ["lost", "broken"])
+    async def test_an_ambiguous_mv_that_did_not_land_fails(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        then: str,
+    ) -> None:
+        """Not there, or unknown: the task fails as before."""
+        _ambiguous_mv(monkeypatch, inner, then)
+        with pytest.raises(TaskExecutionError, match="hand the task"):
+            await _launch(_shared(inner), tmp_path, "a")
+        spool = _alloc_dirs(tmp_path)[0] / "spool"
+        assert list(spool.glob("*.sh")) == []
+        if then == "lost":
+            assert list(spool.iterdir()) == []
 
     async def test_cancel_takes_a_spooled_step_back(
         self, inner: FakeInner, tmp_path: Path
