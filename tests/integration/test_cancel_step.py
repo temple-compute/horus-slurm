@@ -39,20 +39,28 @@ async def test_cancel_step_waiting_for_resources(
     a = await _launch(
         target, d, "a", f"until [ -e {d}/go ]; do sleep 1; done", cpus=2
     )
-    b = await _launch(other, d, "b", "echo ran", cpus=1)
-    assert a.extra is not None and b.extra is not None
-    job, alloc = a.extra["job_id"], Path(b.extra["alloc_dir"])
+    assert a.extra is not None
+    job = a.extra["job_id"]
 
-    async def a_runs_b_claimed() -> bool:
+    async def one_step() -> bool:
         rc, out, err = await sh(target, f"squeue -s -h -j {job} -o %i")
         assert rc == 0, err
+        return len(steps(out)) == 1
+
+    # Spooled together, the pilot may claim b first and give it the CPUs.
+    await wait_for(one_step, 60)
+    b = await _launch(other, d, "b", "echo ran", cpus=1)
+    assert b.extra is not None
+    alloc = Path(b.extra["alloc_dir"])
+
+    async def b_claimed() -> bool:
         return (
-            len(steps(out)) == 1
+            await one_step()
             and (alloc / "run" / "horus-b.sh").exists()
             and not (alloc / "spool" / "horus-b.sh").exists()
         )
 
-    await wait_for(a_runs_b_claimed, 60)
+    await wait_for(b_claimed, 60)
     await other.send_signal(b, signal.SIGTERM)
     code = await poll_until(other, b, 15)
     stdout, _ = await other.read_output(b)
