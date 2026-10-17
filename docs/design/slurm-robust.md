@@ -387,3 +387,8 @@ Not done here (codebase §5), reported for other teams:
 - **Q3. Clean the old `<key>-<gen>` dirs too?** Recommended: no. The
   shared target is not released yet (PR #15 is open), so only dev runs have
   them, and they cannot be grouped by target.
+
+## User decisions
+
+- Target settings are editable from the canvas (user, 2026-10-17: "implement the target settings so are editable"), so the Q1/Q2 constants become SlurmTarget fields with the recommended defaults: `alloc_retention_days: int = Field(default=7, ge=1, le=365, title=_("Allocation folder retention (days)"))` and `max_step_moves: int = Field(default=2, ge=0, le=10, title=_("Task moves to a new allocation"))`. They show in the schema-driven form with no frontend change.
+- Q3: accepted as recommended (legacy `<key>-<gen>` dirs are not cleaned).
