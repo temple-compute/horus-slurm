@@ -277,15 +277,17 @@ class SlurmTarget(BaseTarget):
 
     poll_seconds: float = Field(
         default=5.0,
-        ge=1,
+        ge=5,
         le=300,
         title=_("Poll interval"),
         description=_("Seconds between checks of each task's exit file"),
     )
     queue_check_interval: float = Field(
         default=30.0,
+        # Below Slurm's default MinJobAge (300 s), so an ended job is still
+        # listed on the next read.
         ge=5,
-        le=600,
+        le=120,
         title=_("Queue check interval"),
         description=_("Seconds between squeue checks of a shared allocation"),
     )

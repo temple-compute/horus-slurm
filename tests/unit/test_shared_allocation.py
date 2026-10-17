@@ -508,8 +508,19 @@ class TestSettings:
     ) -> None:
         """The runtime reads poll_interval off the instance."""
         assert SlurmTarget(inner=inner).poll_interval == 5.0
-        target = SlurmTarget(inner=inner, poll_seconds=2)
-        assert target.poll_interval == 2
+        target = SlurmTarget(inner=inner, poll_seconds=10)
+        assert target.poll_interval == 10
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("poll_seconds", 4), ("queue_check_interval", 121)],
+    )
+    def test_out_of_bounds_is_refused(
+        self, inner: FakeInner, field: str, value: float
+    ) -> None:
+        """Faster polls load the login node; slower checks outlive MinJobAge."""
+        with pytest.raises(ValueError):
+            SlurmTarget(inner=inner, **{field: value})
 
     def test_the_schema_exposes_both(self) -> None:
         """So the target form shows them."""
