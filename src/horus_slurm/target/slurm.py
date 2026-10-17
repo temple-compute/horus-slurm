@@ -179,6 +179,9 @@ class _Allocation:
     queue_job_id: str | None = None
     queue: QueueState | None = None
     queue_at: float = 0.0
+    # (job id, monotonic time) of the last failed read, so the copies that
+    # waited on it give up too instead of each retrying in turn.
+    queue_failed: tuple[str, float] | None = None
     # The shared copies of SlurmTarget's sinfo cache.
     _partition_checked: tuple[str, float] | None = None
     _partition_nodes: dict[str, int] | None = None
@@ -1355,7 +1358,8 @@ class SlurmTarget(BaseTarget):
     async def _queue_state(self, handle: JobHandle) -> QueueState | None:
         """
         :meth:`_read_queue`, shared by a named target's copies: one read per
-        :attr:`queue_check_interval`. A failed read is never stored.
+        :attr:`queue_check_interval`. A failed read is never stored, but the
+        copies waiting on it share it rather than each trying again.
         """
         if not self.releasable:
             return await self._read_queue(handle)
@@ -1364,13 +1368,23 @@ class SlurmTarget(BaseTarget):
         cached = alloc.cached_queue(job_id, self.queue_check_interval)
         if cached is not None:
             return cached
+        waited_from = time.monotonic()
         async with alloc.refresh_lock:
             # Another copy may have read it while this one waited.
             cached = alloc.cached_queue(job_id, self.queue_check_interval)
             if cached is not None:
                 return cached
+            failed = alloc.queue_failed
+            if failed is not None and failed[0] == job_id and (
+                failed[1] >= waited_from
+            ):
+                return None
             queue = await self._read_queue(handle)
-            if queue is not None:
+            if queue is None:
+                alloc.queue_failed = (job_id, time.monotonic())
+            elif job_id == alloc.job_id:
+                # A task of an ended allocation must not evict the
+                # current one's reading.
                 alloc.queue_job_id = job_id
                 alloc.queue = queue
                 alloc.queue_at = time.monotonic()

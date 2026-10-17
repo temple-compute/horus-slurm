@@ -394,6 +394,32 @@ class TestQueueCache:
         await b.poll(hb)
         assert _squeues(inner) == 4
 
+    async def test_copies_waiting_on_a_failed_read_share_it(
+        self,
+        inner: FakeInner,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One squeue per round, not one per copy in turn."""
+        read = SlurmTarget._read_queue
+
+        async def slow(self: SlurmTarget, handle: JobHandle) -> Any:
+            await asyncio.sleep(0)  # let the herd queue on the lock
+            return await read(self, handle)
+
+        monkeypatch.setattr(SlurmTarget, "_read_queue", slow)
+        inner.responds(squeue=RUNNING)
+        members = await _members(_shared(inner), tmp_path, 50)
+        inner.responds(squeue=FAILED)
+        _expire(members[0][0])
+        before = _squeues(inner)
+        results = await asyncio.gather(*(m.poll(h) for m, h in members))
+        assert results == [None] * 50
+        assert _squeues(inner) == before + 1
+        # The next round tries again.
+        await members[0][0].poll(members[0][1])
+        assert _squeues(inner) == before + 2
+
     async def test_a_failed_read_is_not_gone(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
@@ -455,6 +481,24 @@ class TestQueueCache:
         assert await target.poll(handle) == 1
         await _launch(target.idle_copy(), tmp_path, "b")
         assert len(inner.commands_starting("sbatch")) == 2
+
+    async def test_an_old_task_keeps_the_new_reading(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A task of an ended allocation does not evict its successor's."""
+        target = _shared(inner, exit_code_retries=0)
+        old = target.idle_copy()
+        old_handle = await _launch(old, tmp_path, "a")
+        inner.responds(squeue=GONE, sbatch=FakeProcess(stdout=b"23456\n"))
+        new = target.idle_copy()
+        new_handle = await _launch(new, tmp_path, "b")
+        inner.responds(squeue=RUNNING)
+        assert await new.poll(new_handle) is None
+        inner.responds(squeue=GONE)
+        assert await old.poll(old_handle) == 1
+        before = _squeues(inner)
+        assert await new.poll(new_handle) is None
+        assert _squeues(inner) == before
 
     async def test_a_launch_reuses_a_fresh_reading(
         self, inner: FakeInner, tmp_path: Path
