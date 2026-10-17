@@ -384,23 +384,26 @@ def _idle_dir(tmp_path: Path, name: str, days: float) -> Path:
     return alloc
 
 
+def _removed(inner: FakeInner) -> list[str]:
+    return [c for c in inner.commands if "rm -rf" in c]
+
+
 @pytest.mark.unit
 class TestCleanup:
-    """Old allocation dirs are removed when a new allocation starts."""
+    """Old allocation dirs are removed once a new allocation is queued."""
 
-    async def test_old_dirs_go_and_each_targets_newest_stays(
+    async def test_old_dirs_go_and_the_newest_stays(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """Grouped by target, aged by heartbeat; others are not touched."""
-        inner.runs("find ")
+        """Aged by heartbeat; other targets' and foreign dirs stay."""
+        inner.runs("cd -P ")
         gone = [
             _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30),
             _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-2", 10),
-            _idle_dir(tmp_path, "gpu.cccccccccccc-1", 40),
         ]
         kept = [
             _idle_dir(tmp_path, "hpc.bbbbbbbbbbbb-1", 1),
-            _idle_dir(tmp_path, "gpu.cccccccccccc-2", 30),
+            _idle_dir(tmp_path, "gpu.cccccccccccc-1", 40),
             _idle_dir(tmp_path, "aaaaaaaaaaaa-1", 30),
         ]
         elsewhere = _idle_dir(tmp_path / "other", "hpc.dddddddddddd-1", 30)
@@ -413,30 +416,92 @@ class TestCleanup:
         assert set(_alloc_dirs(tmp_path)) == {*kept, link, current}
         assert not any(p.exists() for p in gone)
         assert (elsewhere / "heartbeat").exists()
+        # The pilot was submitted first.
+        assert inner.commands.index(_removed(inner)[0]) > inner.commands.index(
+            inner.commands_starting("sbatch")[0]
+        )
 
     async def test_retention_is_the_targets(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """A longer retention keeps what the default would remove."""
-        inner.runs("find ")
+        inner.runs("cd -P ")
         old = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30)
         await _launch(_shared(inner, alloc_retention_days=60), tmp_path, "a")
         assert old.exists()
+
+    async def test_a_listed_pilot_keeps_its_dir(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Still running a step after its orchestrator died."""
+        inner.runs("cd -P ")
+        live = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30)
+        old = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-2", 30)
+        inner.responds(
+            squeue=FakeProcess(stdout=f"{live}/pilot.sh\n".encode())
+        )
+        await _launch(_shared(inner), tmp_path, "a")
+        assert live.exists() and not old.exists()
+
+    async def test_a_failed_squeue_removes_nothing(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Without the queue, any dir may be live."""
+        inner.runs("cd -P ")
+        old = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30)
+        inner.responds(squeue=FakeProcess(returncode=1))
+        await _launch(_shared(inner), tmp_path, "a")
+        assert old.exists() and _removed(inner) == []
+
+    async def test_a_long_backlog_goes_in_chunks(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """No command grows past the argument size limit."""
+        inner.runs("cd -P ")
+        for n in range(450):
+            _idle_dir(tmp_path, f"hpc.aaaaaaaaaaaa-{n}", 30)
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        assert len(_removed(inner)) == 3
+        assert len(_alloc_dirs(tmp_path)) == 1
+
+    async def test_a_failed_find_still_counts_what_it_listed(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """One unreadable entry does not turn cleaning off."""
+        root = tmp_path / ALLOC_DIR
+        old = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30)
+        newer = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-2", 1)
+        listed = (
+            f"{time.time():.0f}\n"
+            f"{(old / 'heartbeat').stat().st_mtime} ./{old.name}\n"
+            f"{(newer / 'heartbeat').stat().st_mtime} ./{newer.name}\n"
+        )
+        inner.runs(f"cd -P -- {root} && [ -O")
+        inner.responds(
+            **{
+                f"cd -P -- {root} && date": FakeProcess(
+                    stdout=listed.encode(), returncode=1
+                )
+            }
+        )
+        await _launch(_shared(inner), tmp_path, "a")
+        assert not old.exists() and newer.exists()
 
     async def test_a_failed_find_is_ignored(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """Cleanup never fails the allocation."""
-        inner.responds(find=FakeProcess(returncode=1))
+        inner.responds(**{"cd -P ": FakeProcess(returncode=1)})
         await _launch(_shared(inner), tmp_path, "a")
-        assert inner.commands_starting("find ")
+        assert inner.commands_starting("cd -P ")
         assert len(inner.commands_starting("sbatch")) == 1
 
     async def test_a_failed_rm_is_ignored(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """Nor does a dir it cannot remove."""
-        inner.runs("find ")
+        inner.runs("cd -P ")
         stuck = _idle_dir(tmp_path, "hpc.aaaaaaaaaaaa-1", 30) / "x"
         stuck.mkdir()
         (stuck / "f").touch()
@@ -445,20 +510,25 @@ class TestCleanup:
             await _launch(_shared(inner), tmp_path, "a")
         finally:
             stuck.chmod(0o700)
-        assert inner.commands_starting("rm -rf") and stuck.exists()
+        assert _removed(inner) and stuck.exists()
         assert len(inner.commands_starting("sbatch")) == 1
 
-    async def test_cleanup_runs_once_per_process(
+    async def test_cleanup_runs_once_a_day(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """A later allocation in the same working dir does not look again."""
-        inner.runs("find ")
+        inner.runs("cd -P ")
         target = _shared(inner)
         await _launch(target, tmp_path, "a")
         await target.release("idle_cap")
         await _launch(target, tmp_path, "b")
-        assert len(inner.commands_starting("sbatch")) == 2
-        assert len(inner.commands_starting("find ")) == 1
+        assert len(inner.commands_starting("cd -P ")) == 1
+        for key in slurm_mod._CLEANED:
+            slurm_mod._CLEANED[key] -= slurm_mod.CLEAN_INTERVAL_S
+        await target.release("idle_cap")
+        await _launch(target, tmp_path, "c")
+        assert len(inner.commands_starting("sbatch")) == 3
+        assert len(inner.commands_starting("cd -P ")) == 2
 
 
 @pytest.mark.unit

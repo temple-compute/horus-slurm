@@ -129,11 +129,14 @@ while true; do
 done
 """
 
+CLEAN_INTERVAL_S = 86400
+"""Seconds before a process cleans the same allocation root again."""
+
 _ALLOC_NAME = re.compile(r"([a-z][a-z0-9_-]{0,62})\.[0-9a-f]{12}-[0-9]+")
 """An allocation dir name, ``<ref>.<lease_key>-<generation>``."""
 
-_CLEANED_ROOTS: set[str] = set()
-"""Allocation roots already cleaned by this process."""
+_CLEANED: dict[tuple[str, str, str], float] = {}
+"""When this process last cleaned each (location, root, target ref)."""
 
 _JOB_ID = re.compile(r"\d+(_\d+)?")
 """A job id as sbatch prints it, before it goes into another command."""
@@ -686,7 +689,6 @@ class SlurmTarget(BaseTarget):
                     f"{root}/{self._ref}.{self.lease_key}-{handle.generation}"
                 )
                 await self._make_private_dir(alloc_dir)
-                await self._clean_alloc_dirs(root, alloc_dir)
                 script_path = f"{alloc_dir}/pilot.sh"
                 await self.inner.put_file(
                     self._pilot_script(alloc_dir).encode(), script_path
@@ -709,6 +711,8 @@ class SlurmTarget(BaseTarget):
                         )
             finally:
                 done.set()
+            # After sbatch, so the pilot queues while this runs.
+            await self._clean_alloc_dirs(root, alloc_dir)
         await done.wait()
         return handle
 
@@ -741,47 +745,72 @@ class SlurmTarget(BaseTarget):
 
     async def _clean_alloc_dirs(self, root: str, keep: str) -> None:
         """
-        Remove allocation dirs under *root* idle for longer than
-        ``alloc_retention_days``, except *keep* and each target's newest.
+        Remove this target's allocation dirs under *root* idle for longer
+        than ``alloc_retention_days``, except *keep*, the newest, and any
+        whose pilot Slurm still lists.
 
         Age is the heartbeat's, which keepalive touches, so a live
-        allocation of another run is never old. Once per process per root;
-        best effort, never raises.
+        allocation of another run is never old. Other targets' dirs follow
+        their own retention. At most once a day per process; best effort,
+        never raises.
         """
-        if root in _CLEANED_ROOTS:
+        key = (self.location_id, root, str(self._ref))
+        last = _CLEANED.get(key)
+        if last is not None and time.monotonic() - last < CLEAN_INTERVAL_S:
             return
-        _CLEANED_ROOTS.add(root)
+        _CLEANED[key] = time.monotonic()
         q = shlex.quote
+        # Relative to the real dir, so later commands name entries in the
+        # dir that was listed, and a root starting with `-` is no option.
+        cd = f"cd -P -- {q(root)}"
         try:
             proc = await self.inner.run_command_sync(
-                f"find {q(root)} -mindepth 2 -maxdepth 2 -type f "
-                f"-name heartbeat -printf '%T@ %h\\n'"
+                f"{cd} && date +%s && find . -mindepth 2 -maxdepth 2 "
+                f"-type f -name heartbeat -printf '%T@ %h\\n'"
+            )
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                # One unreadable entry fails find; the rest still counts.
+                horus_logger.log.debug(err.decode(errors="replace").strip())
+            now, *lines = out.decode(errors="replace").splitlines()
+            # The cluster's clock, as for the heartbeat times.
+            cutoff = float(now) - self.alloc_retention_days * 86400
+            found: list[tuple[float, str]] = []
+            for line in lines:
+                mtime, _sep, path = line.partition(" ")
+                match = _ALLOC_NAME.fullmatch(path.removeprefix("./"))
+                if match is not None and match[1] == self._ref:
+                    found.append((float(mtime), match[0]))
+            kept = {max(found)[1], Path(keep).name} if found else set()
+            old = [n for m, n in found if m < cutoff and n not in kept]
+            if not old:
+                return
+            # A pilot outlives a dead orchestrator while a step runs.
+            proc = await self.inner.run_command_sync(
+                'squeue -h -u "$(id -un)" -o %o'
             )
             out, err = await proc.communicate()
             if proc.returncode != 0:
                 raise RuntimeError(err.decode(errors="replace").strip())
-            cutoff = time.time() - self.alloc_retention_days * 86400
-            newest: dict[str, tuple[float, str]] = {}
-            found: list[tuple[float, str]] = []
-            for line in out.decode(errors="replace").splitlines():
-                mtime, _sep, path = line.partition(" ")
-                parent, _sep, name = path.rpartition("/")
-                match = _ALLOC_NAME.fullmatch(name)
-                if parent != root or match is None:
-                    continue
-                entry = (float(mtime), path)
-                found.append(entry)
-                newest[match[1]] = max(newest.get(match[1], entry), entry)
-            kept = {path for _mtime, path in newest.values()} | {keep}
-            old = [p for m, p in found if m < cutoff and p not in kept]
-            if not old:
-                return
-            proc = await self.inner.run_command_sync(
-                "rm -rf " + " ".join(q(p) for p in old)
-            )
-            _out, err = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(err.decode(errors="replace").strip())
+            live = out.decode(errors="replace").split()
+            old = [
+                n
+                for n in old
+                if not any(c.endswith(f"/{n}/pilot.sh") for c in live)
+            ]
+            # In chunks, so a long backlog stays under the argument limit;
+            # one chunk that fails does not stop the rest.
+            errors = []
+            for i in range(0, len(old), 200):
+                names = " ".join(q(n) for n in old[i : i + 200])
+                proc = await self.inner.run_command_sync(
+                    f"{cd} && [ -O . ] && rm -rf -- {names}"
+                )
+                _out, err = await proc.communicate()
+                if proc.returncode != 0:
+                    errors.append(err.decode(errors="replace").strip())
+            if errors:
+                raise RuntimeError("\n".join(errors))
         except Exception as exc:
             horus_logger.log.debug(
                 _("Could not clean old allocation dirs in %(dir)s: %(err)s")
