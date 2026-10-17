@@ -7,6 +7,11 @@ RUFF_FORMAT_CHECK_CMD = ruff format --check --diff .
 RUFF_FIX_CMD = ruff check --fix src/ tests/
 RUFF_FORMAT_CMD = ruff format .
 MYPY_CMD = mypy src/ tests/
+INTEGRATION_CMD = pytest tests/integration --no-cov -p no:cacheprovider --junitxml=integration-results.xml
+
+# Integration cluster (tests/integration/cluster)
+ITEST_DIR ?= /tmp/horus-slurm-itest-$(shell id -u)
+ITEST_PROJECT ?= horus-slurm-itest
 
 # i18n settings (babel)
 BABEL_CFG = babel.cfg
@@ -20,11 +25,13 @@ PROJECT_NAME = horus-slurm
 ORGANIZATION = Temple Compute
 LICENSE_TMPL = .mit.tmpl
 
-.PHONY: test lint format type-check clean help ruff-check ruff-format-check mypy-check babel-update babel-check babel-add babel-extract add-license-headers
+.PHONY: test lint format type-check clean help ruff-check ruff-format-check mypy-check babel-update babel-check babel-add babel-extract add-license-headers integration integration-down
 
 help:
 	@echo "Available commands:"
 	@echo "  test                Run all tests with coverage (same as CI)"
+	@echo "  integration         Start the docker Slurm cluster and run integration tests"
+	@echo "  integration-down    Remove the docker Slurm cluster"
 	@echo "  lint                Run all linting tools (same as CI)"
 	@echo "  ruff-check          Check code with ruff linter (used by CI)"
 	@echo "  ruff-format-check   Check code formatting with ruff (used by CI)"
@@ -40,6 +47,14 @@ help:
 test:
 	# Set PYTHONPATH to current directory to ensure tests can find other test modules
 	PYTHONPATH=. $(PYTEST_CMD)
+
+integration:
+	ITEST_DIR="$(ITEST_DIR)" ITEST_PROJECT="$(ITEST_PROJECT)" tests/integration/cluster/up.sh
+	ITEST_DIR="$(ITEST_DIR)" HORUS_SLURM_ITEST=1 HORUS_SLURM_ITEST_LOGIN="$(ITEST_PROJECT)-slurmctld-1" PYTHONPATH=. $(INTEGRATION_CMD)
+
+integration-down:
+	ITEST_DIR="$(ITEST_DIR)" docker compose -p "$(ITEST_PROJECT)" -f tests/integration/cluster/compose.yaml down -v -t 2
+	rm -rf "$(ITEST_DIR)"/test_*-*
 
 # Individual check commands
 ruff-check:
