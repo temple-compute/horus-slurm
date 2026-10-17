@@ -195,9 +195,11 @@ class _Allocation:
     # Set once the current allocation's ready callbacks have run; steps are
     # handed in only after.
     callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
-    # Tasks bound to this generation, and the last generation seen running.
+    # Tasks bound to this generation, and the last generation seen running
+    # and announced released.
     members: set[str] = field(default_factory=set)
     ready_generation: int = 0
+    released_generation: int = 0
     # One squeue reading shared by all copies, keyed by the job id it was
     # read for. Taken after `lock`, never before it.
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -705,6 +707,7 @@ class SlurmTarget(BaseTarget):
                     raise TaskExecutionError(
                         _("scancel failed: %(error)s") % {"error": error}
                     )
+                self._emit_allocation("released", reason=reason)
                 handle.job_id = None
                 # The launchers and job scripts; pilot.log stays.
                 alloc = shlex.quote(handle.alloc_dir)
@@ -733,6 +736,15 @@ class SlurmTarget(BaseTarget):
         if not self.releasable:
             return
         alloc = self._alloc
+        # Once per generation each, whichever copy sees it first.
+        if phase == "ready":
+            if alloc.ready_generation == alloc.generation:
+                return
+            alloc.ready_generation = alloc.generation
+        elif phase == "released":
+            if alloc.released_generation == alloc.generation:
+                return
+            alloc.released_generation = alloc.generation
         # A lease copy can still hold a task from an earlier generation.
         task_id = self._task.id if self._task is not None else ""
         try:
@@ -1254,6 +1266,11 @@ class SlurmTarget(BaseTarget):
         # between two polls would otherwise never report having run.
         queue = await self._queue_state(handle)
         gone = queue is not None and queue.gone
+        if queue is not None and job_id == self._alloc.job_id:
+            if queue.state == "RUNNING":
+                self._emit_allocation("ready")
+            elif gone:
+                self._emit_allocation("released", reason="gone")
         if queue is not None and queue.state:
             await self._announce(
                 job_id,
