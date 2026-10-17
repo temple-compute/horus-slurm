@@ -20,6 +20,7 @@ Slurm target for horus-runtime.
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 import signal
 import time
@@ -100,18 +101,35 @@ Directory under the working directory holding each shared allocation's pilot
 script, log and spool.
 """
 
+HEARTBEAT_STALE_S = 900
+"""
+Seconds without a :meth:`SlurmTarget.keepalive` after which an idle pilot
+ends its allocation: the orchestrator is gone, and nobody will release it.
+Three of the lease manager's keepalive intervals.
+"""
+
 # The pilot runs inside the allocation and starts every launcher dropped into
 # spool/ as a job step; a launcher is claimed with `mv`, so it runs once.
-PILOT_LOOP = """\
-mkdir -p spool run
+# Only the user's own regular files run: the directory is private, and this
+# is the second line of defence on a shared filesystem.
+PILOT_LOOP = f"""\
+umask 077
 while true; do
   for f in spool/*.sh; do
-    [ -e "$f" ] || continue
-    mv "$f" run/ && bash "run/${f#spool/}" &
+    [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ] || continue
+    mv "$f" run/ && bash "run/${{f#spool/}}" &
   done
+  if [ -z "$(jobs -rp)" ] && \\
+    [ $(( $(date +%s) - $(stat -c %Y heartbeat) )) -gt {HEARTBEAT_STALE_S} ]
+  then
+    exit 0
+  fi
   sleep 2
 done
 """
+
+_JOB_ID = re.compile(r"\d+(_\d+)?")
+"""A job id as sbatch prints it, before it goes into another command."""
 
 
 @dataclass(eq=False)
@@ -130,6 +148,9 @@ class _Allocation:
     ready_callbacks: list[Callable[[], Awaitable[None]]] = field(
         default_factory=list
     )
+    # Set once the current allocation's ready callbacks have run; steps are
+    # handed in only after.
+    callbacks_done: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _Allocation:
         """A deep copy is a separate declared target: no allocation yet."""
@@ -189,15 +210,20 @@ class SlurmTarget(BaseTarget):
     qos: str | None = None
     nodes: int = 1
     ntasks: int = 1
-    cpus_per_task: int | None = None
+    cpus_per_task: int | None = Field(default=None, title=_("CPUs per task"))
     mem: str | None = Field(
         default=None,
+        title=_("Memory"),
         description=_(
             "Memory per node with a unit, e.g. 4G. "
             "A bare number is megabytes to Slurm."
         ),
     )
-    time_limit: str | None = None  # e.g. "01:00:00"
+    time_limit: str | None = Field(
+        default=None,
+        title=_("Time limit"),
+        description=_("Slurm format, e.g. 02:00:00 or 1-00:00:00"),
+    )
     gres: str | None = None  # e.g. "gpu:1"
     extra_sbatch_args: list[str] = Field(default_factory=list)
 
@@ -219,7 +245,11 @@ class SlurmTarget(BaseTarget):
     )
 
     # The allocation's files live on the cluster's shared filesystem, so a
-    # released allocation loses no output.
+    # released allocation loses no output. A node-local working_directory
+    # (/tmp, $TMPDIR) breaks this, as it breaks inline jobs too.
+    #
+    # A step gets only the task's own `resources`: a task that declares none
+    # runs on one CPU, with no GPU even when `gres` is set here.
     keeps_data_on_release: ClassVar[bool] = True
 
     # Slurm jobs are inherently queued/detached -- there is no "run this
@@ -381,15 +411,19 @@ class SlurmTarget(BaseTarget):
         await self.inner.mkdir(str(Path(stdout_path).parent))
 
         script_path = f"{job_dir}/job.sh"
-        step: str | None = None
+        extra: dict[str, str] = {}
         if self.releasable:
             script = "\n".join(
                 ["#!/bin/bash", *self._script_body(cmd, cwd, env, job_dir)]
             )
-            await self.inner.put_file(f"{script}\n".encode(), script_path)
             step = f"horus-{Path(job_dir).name}"
-            job_id = await self._submit_step(step, script_path, job_dir)
+            job_id, alloc_dir = await self._submit_step(
+                step, f"{script}\n", job_dir
+            )
+            # Kept in the private allocation dir, read when the step starts.
+            script_path = f"{alloc_dir}/run/{step}.job"
             raw_id = job_id
+            extra = {"step": step, "alloc_dir": alloc_dir}
         else:
             script = self._build_sbatch_script(
                 cmd, cwd=cwd, env=env, job_dir=job_dir
@@ -412,9 +446,7 @@ class SlurmTarget(BaseTarget):
         )
         await self._announce(job_id, SUBMITTED)
 
-        extra = {"job_id": job_id, "raw_job_id": raw_id}
-        if step is not None:
-            extra["step"] = step
+        extra |= {"job_id": job_id, "raw_job_id": raw_id}
         # pid stays None: a job id is not a process id.
         return JobHandle(pid=None, job_dir=job_dir, extra=extra)
 
@@ -436,7 +468,13 @@ class SlurmTarget(BaseTarget):
         # submissions. Array jobs ("<jobid>_<n>") aren't handled here -- see
         # the note at the bottom of this file.
         raw_id = out.decode().strip()
-        return raw_id.split(";", 1)[0], raw_id
+        job_id = raw_id.split(";", 1)[0]
+        if not _JOB_ID.fullmatch(job_id):
+            raise TaskExecutionError(
+                _("sbatch returned an unexpected job id: %(raw)s")
+                % {"raw": raw_id}
+            )
+        return job_id, raw_id
 
     # --- shared allocation ---------------------------------------------------
 
@@ -520,7 +558,8 @@ class SlurmTarget(BaseTarget):
                 }[what],
             }
             for want, have, what, shown in checks
-            if want and have is not None and want > have
+            # A 0 on the target means "all" or "no limit" to Slurm.
+            if want and have and want > have
         ]
 
     def on_ready(self, callback: Callable[[], Awaitable[None]]) -> None:
@@ -535,24 +574,52 @@ class SlurmTarget(BaseTarget):
                 proc = await self.inner.run_command_sync(
                     f"scancel {handle.job_id}"
                 )
-                out, err = await proc.communicate()
-                del out
-                if proc.returncode != 0:
+                _out, err = await proc.communicate()
+                error = err.decode(errors="replace").strip()
+                # Already gone (time limit, idle exit) and purged: done.
+                if proc.returncode != 0 and "invalid job id" not in (
+                    error.lower()
+                ):
                     raise TaskExecutionError(
-                        _("scancel failed: %(error)s")
-                        % {"error": err.decode(errors="replace").strip()}
+                        _("scancel failed: %(error)s") % {"error": error}
                     )
                 handle.job_id = None
+                # The launchers and job scripts; pilot.log stays.
+                alloc = shlex.quote(handle.alloc_dir)
+                proc = await self.inner.run_command_sync(
+                    f"rm -rf {alloc}/spool {alloc}/run"
+                )
+                await proc.wait()
             if reason in ("run_end", "abort"):
                 # Registered per run; a re-run registers its own.
                 handle.ready_callbacks.clear()
 
+    async def keepalive(self) -> None:
+        """
+        Prove the orchestrator still wants the allocation: an idle pilot
+        whose heartbeat goes stale ends it. Never raises.
+        """
+        handle = self._alloc
+        if handle.job_id is None:
+            return
+        try:
+            proc = await self.inner.run_command_sync(
+                f"touch {shlex.quote(handle.alloc_dir)}/heartbeat"
+            )
+            await proc.wait()
+        except Exception as exc:
+            horus_logger.log.debug(
+                _("Could not keep the allocation alive: %(err)s")
+                % {"err": exc}
+            )
+
     async def _allocation(self) -> _Allocation:
         """
         The live allocation, submitted first if there is none or it ended
-        on its own (time limit, cancelled outside Horus).
+        on its own (time limit, idle exit, cancelled outside Horus).
         """
         handle = self._alloc
+        submitted = False
         async with handle.lock:
             if handle.job_id is not None:
                 queue = await self._queue_state(
@@ -568,15 +635,20 @@ class SlurmTarget(BaseTarget):
                     f"{self.resolved_working_directory}/{ALLOC_DIR}/"
                     f"{self.lease_key}-{handle.generation}"
                 )
-                await self.inner.mkdir(f"{alloc_dir}/spool")
+                await self._make_private_dir(alloc_dir)
                 script_path = f"{alloc_dir}/pilot.sh"
                 await self.inner.put_file(
                     self._pilot_script(alloc_dir).encode(), script_path
                 )
                 handle.job_id, _raw = await self._sbatch(script_path)
                 handle.alloc_dir = alloc_dir
-                # Under the lock, so no step is handed in before they ran.
-                # The allocation's filesystem is reachable while it queues.
+                handle.callbacks_done = asyncio.Event()
+                submitted = True
+            done = handle.callbacks_done
+        if submitted:
+            # Outside the lock: a long restore must not hold up a release.
+            # The allocation's filesystem is reachable while it queues.
+            try:
                 for callback in list(handle.ready_callbacks):
                     try:
                         await callback()
@@ -584,7 +656,37 @@ class SlurmTarget(BaseTarget):
                         horus_logger.log.exception(
                             _("A machine-ready callback failed.")
                         )
-            return handle
+            finally:
+                done.set()
+        await done.wait()
+        return handle
+
+    async def _make_private_dir(self, alloc_dir: str) -> None:
+        """
+        Create *alloc_dir* readable and writable by this user only.
+
+        The pilot runs whatever is spooled there, so on a shared filesystem
+        nobody else may create, swap or write into it: the parent must be
+        ours and not a symlink, and the leaf must not exist yet.
+        """
+        q = shlex.quote
+        root = q(str(Path(alloc_dir).parent))
+        leaf = q(alloc_dir)
+        proc = await self.inner.run_command_sync(
+            f"umask 077 && mkdir -p {root} && [ -O {root} ] "
+            f"&& [ ! -L {root} ] && chmod 700 {root} "
+            f"&& mkdir -m 700 {leaf} && mkdir {leaf}/spool {leaf}/run "
+            f"&& touch {leaf}/heartbeat"
+        )
+        _out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise TaskExecutionError(
+                _("Could not create the allocation directory %(dir)s: %(err)s")
+                % {
+                    "dir": alloc_dir,
+                    "err": err.decode(errors="replace").strip(),
+                }
+            )
 
     def _pilot_script(self, alloc_dir: str) -> str:
         """The allocation's batch script: its size, then the pilot loop."""
@@ -597,18 +699,21 @@ class SlurmTarget(BaseTarget):
         )
         log = f"{alloc_dir}/pilot.log"
         lines = self._sbatch_header(f"horus-{self._ref}", log, log, resolved)
-        lines += ["", f"cd {shlex.quote(alloc_dir)}", PILOT_LOOP]
+        # A requeued pilot would not see the steps it had already claimed.
+        lines += ["#SBATCH --no-requeue", "", f"cd {shlex.quote(alloc_dir)}"]
+        lines.append(PILOT_LOOP)
         return "\n".join(lines)
 
     async def _submit_step(
-        self, step: str, script_path: str, job_dir: str
-    ) -> str:
+        self, step: str, script: str, job_dir: str
+    ) -> tuple[str, str]:
         """
-        Hand *script_path* to the allocation as job step *step*; the
-        allocation's job id.
+        Hand *script* to the allocation as job step *step*; the
+        allocation's job id and directory.
 
         The launcher writes the step's exit code itself when srun fails or
-        the step is cancelled, so ``poll`` never waits on a step that will
+        the step is cancelled (a ``<step>.cancel`` mark, watched while srun
+        waits for room or runs), so ``poll`` never waits on a step that will
         not run.
         """
         handle = await self._allocation()
@@ -623,25 +728,38 @@ class SlurmTarget(BaseTarget):
             if total and self.cpus_per_task:
                 share = total * step_res.cpus_per_task // self.cpus_per_task
                 mem = f"{max(1, share)}M"
+            else:
+                # The job's memory, without holding it from other steps.
+                mem = "0"
+        # A step gets every GPU of the job unless it says otherwise.
+        gres = step_res.gres or ("none" if self.gres else None)
         stdout_path, stderr_path = self._log_paths(job_dir)
         q = shlex.quote
+        run = f"{handle.alloc_dir}/run/{step}"
         exit_path = q(f"{job_dir}/exit_code")
+        cancel = q(f"{run}.cancel")
         srun = [
             "srun --exact --ntasks=1",
             f"--job-name={q(step)}",
             f"--cpus-per-task={step_res.cpus_per_task}",
-            *([f"--mem={q(mem)}"] if mem else []),
-            *([f"--gres={q(step_res.gres)}"] if step_res.gres else []),
+            f"--mem={q(mem)}",
+            *([f"--gres={q(gres)}"] if gres else []),
             f"--output={q(stdout_path)}",
             f"--error={q(stderr_path)}",
-            f"bash {q(script_path)}",
+            f"bash {q(run + '.job')}",
         ]
-        cancelled = f"{{ echo 143 > {exit_path}; exit; }}"
         launcher = (
-            f"[ -e {q(job_dir)}/cancel ] && {cancelled}\n"
-            f"{' '.join(srun)}\n"
-            f"code=$?; [ -e {exit_path} ] || echo $code > {exit_path}\n"
+            f"[ -e {cancel} ] && {{ echo 143 > {exit_path}; exit; }}\n"
+            f"{' '.join(srun)} &\n"
+            "p=$!\n"
+            "while kill -0 $p 2>/dev/null; do\n"
+            f"  [ -e {cancel} ] && kill -TERM $p\n"
+            "  sleep 1\n"
+            "done\n"
+            "wait $p; code=$?\n"
+            f"[ -e {exit_path} ] || echo $code > {exit_path}\n"
         )
+        await self.inner.put_file(script.encode(), f"{run}.job")
         spool = f"{handle.alloc_dir}/spool/{step}"
         await self.inner.put_file(launcher.encode(), f"{spool}.tmp")
         # Renamed whole, so the pilot never runs a half-written launcher.
@@ -653,7 +771,7 @@ class SlurmTarget(BaseTarget):
                 _("Could not hand the task to allocation %(job_id)s.")
                 % {"job_id": handle.job_id}
             )
-        return str(handle.job_id)
+        return str(handle.job_id), handle.alloc_dir
 
     async def _step_id(self, job_id: str, step: str) -> str | None:
         """The id (``<job>.<n>``) of the running step named *step*."""
@@ -663,7 +781,7 @@ class SlurmTarget(BaseTarget):
         out, _err = await proc.communicate()
         for line in out.decode(errors="replace").splitlines():
             step_id, _sep, name = line.strip().partition("|")
-            if name == step:
+            if name == step and re.fullmatch(r"\d+(_\d+)?\.\d+", step_id):
                 return step_id
         return None
 
@@ -1003,26 +1121,34 @@ class SlurmTarget(BaseTarget):
     ) -> None:
         """
         Signal one task's job step, never the allocation the others share.
-        A cancelled step not started yet never starts: its launcher sees
-        the ``cancel`` mark and records the exit code instead.
+
+        A stop leaves a ``cancel`` mark the launcher watches, whether srun
+        is waiting for room or running; a step still spooled is taken back
+        and recorded as cancelled at once.
         """
-        stop = sig in (signal.SIGKILL, signal.SIGTERM)
-        if stop:
-            await self.inner.put_file(b"", f"{handle.job_dir}/cancel")
-        step_id = await self._step_id(job_id, step)
-        if step_id is not None:
-            try:
-                name = signal.Signals(sig).name.removeprefix("SIG")
-            except ValueError:
-                name = "TERM"
-            flag = "" if stop else f"--signal={name} "
-            proc = await self.inner.run_command_sync(
-                f"scancel {flag}{step_id}"
-            )
-            await proc.wait()
-        if stop:
-            self._cancelling = True
-            await self._announce(job_id, CANCELLING)
+        q = shlex.quote
+        alloc = (handle.extra or {}).get("alloc_dir", "")
+        if sig not in (signal.SIGKILL, signal.SIGTERM):
+            step_id = await self._step_id(job_id, step)
+            if step_id is not None:
+                try:
+                    name = signal.Signals(sig).name.removeprefix("SIG")
+                except ValueError:
+                    name = "TERM"
+                proc = await self.inner.run_command_sync(
+                    f"scancel --signal={name} {step_id}"
+                )
+                await proc.wait()
+            return
+        exit_path = q(f"{handle.job_dir}/exit_code")
+        proc = await self.inner.run_command_sync(
+            f"touch {q(f'{alloc}/run/{step}.cancel')}; "
+            f"rm {q(f'{alloc}/spool/{step}.sh')} 2>/dev/null "
+            f"&& echo 143 > {exit_path}"
+        )
+        await proc.wait()
+        self._cancelling = True
+        await self._announce(job_id, CANCELLING)
 
     # --- helpers -------------------------------------------------------------
 

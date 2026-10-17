@@ -9,15 +9,20 @@ Unit tests for a shared (named) SlurmTarget: one allocation, one job step
 per task.
 """
 
+import asyncio
+import os
 import signal as signal_mod
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 from horus_runtime.core.resources import ResourceRequest
 from horus_runtime.core.target.channel import JobHandle
+from horus_runtime.core.task.exceptions import TaskExecutionError
 
+from horus_slurm.target import slurm as slurm_mod
 from horus_slurm.target.slurm import ALLOC_DIR, SlurmTarget
 
 from .conftest import FakeInner, FakeProcess
@@ -46,6 +51,8 @@ class _Task:
 
 
 def _shared(inner: FakeInner, **kwargs: Any) -> SlurmTarget:
+    # The file plumbing runs for real; Slurm commands stay canned.
+    inner.runs("umask ", "mv ", "touch ", "rm ")
     fields: dict[str, Any] = {
         "cpus_per_task": 8,
         "mem": "16G",
@@ -61,7 +68,11 @@ def _shared(inner: FakeInner, **kwargs: Any) -> SlurmTarget:
 
 
 async def _launch(
-    target: SlurmTarget, tmp_path: Path, name: str, **resources: Any
+    target: SlurmTarget,
+    tmp_path: Path,
+    name: str,
+    cmd: str = "echo hi",
+    **resources: Any,
 ) -> JobHandle:
     task = _Task(
         str(tmp_path / name),
@@ -70,13 +81,16 @@ async def _launch(
     )
     target.bind(task)  # type: ignore[arg-type]
     return await target.launch(
-        "echo hi", cwd=task.working_dir, env=None, job_dir=f"{tmp_path}/{name}"
+        cmd, cwd=task.working_dir, env=None, job_dir=f"{tmp_path}/{name}"
     )
 
 
-def _spooled(inner: FakeInner) -> list[Path]:
-    root = Path(str(inner.working_directory)) / ALLOC_DIR
-    return sorted(root.glob("*/spool/*.tmp"))
+def _alloc_dirs(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / ALLOC_DIR).iterdir())
+
+
+def _spooled(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / ALLOC_DIR).glob("*/spool/*.sh"))
 
 
 @pytest.mark.unit
@@ -112,26 +126,74 @@ class TestAllocation:
         assert a.extra["job_id"] == b.extra["job_id"] == "12345"
         assert a.extra["step"] != b.extra["step"]
         assert target.is_live and target.generation == 1
-        launchers = [p.read_text() for p in _spooled(inner)]
+        launchers = [p.read_text() for p in _spooled(tmp_path)]
         assert len(launchers) == 2
         # The task's own request, not the allocation's size.
         assert any("--cpus-per-task=2 --mem=4096M" in t for t in launchers)
         # No request: one CPU and its even share of memory.
         assert any("--cpus-per-task=1 --mem=2048M" in t for t in launchers)
-        assert len(inner.commands_starting("mv ")) == 2
+
+    async def test_the_allocation_dir_is_private(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Only its owner may write where the pilot runs scripts from."""
+        await _launch(_shared(inner), tmp_path, "a")
+        (alloc,) = _alloc_dirs(tmp_path)
+        assert alloc.stat().st_mode & 0o777 == 0o700
+        assert (tmp_path / ALLOC_DIR).stat().st_mode & 0o777 == 0o700
+        # The job script sits there too, not in the task's job dir.
+        assert list((alloc / "run").glob("*.job"))
+
+    async def test_an_existing_allocation_dir_is_refused(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Somebody else's directory is never used as the spool."""
+        target = _shared(inner)
+        planted = tmp_path / ALLOC_DIR / f"{target.lease_key}-1"
+        planted.mkdir(parents=True)
+        with pytest.raises(TaskExecutionError, match="allocation directory"):
+            await _launch(target, tmp_path, "a")
+        assert inner.commands_starting("sbatch") == []
 
     async def test_pilot_is_sized_by_the_target(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """The allocation asks for the target's fields, not a task's."""
         await _launch(_shared(inner, partition="cpu"), tmp_path, "a", cpus=2)
-        pilot = next((tmp_path / ALLOC_DIR).glob("*/pilot.sh")).read_text()
+        pilot = (_alloc_dirs(tmp_path)[0] / "pilot.sh").read_text()
         assert "#SBATCH --job-name=horus-hpc" in pilot
         assert "#SBATCH --cpus-per-task=8" in pilot
         assert "#SBATCH --mem=16G" in pilot
         assert "#SBATCH --time=02:00:00" in pilot
         assert "#SBATCH --partition=cpu" in pilot
-        assert 'mv "$f" run/' in pilot
+        assert "#SBATCH --no-requeue" in pilot
+
+    async def test_a_step_takes_no_gpu_it_did_not_ask_for(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Else it would hold every GPU of the allocation."""
+        inner.responds(squeue=RUNNING)
+        target = _shared(inner, gres="gpu:2")
+        await _launch(target, tmp_path, "a")
+        await _launch(target, tmp_path, "b", gpus=1)
+        launchers = [p.read_text() for p in _spooled(tmp_path)]
+        assert any("--gres=none" in t for t in launchers)
+        assert any("--gres=gpu:1" in t for t in launchers)
+
+    async def test_no_memory_share_falls_back_to_shared_memory(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """--mem=0: the job's memory, not held from other steps."""
+        await _launch(_shared(inner, mem="0"), tmp_path, "a")
+        assert "--mem=0 " in _spooled(tmp_path)[0].read_text()
+
+    async def test_an_odd_job_id_is_refused(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """A job id goes into later commands, so it must look like one."""
+        inner.responds(sbatch=FakeProcess(stdout=b"12345 && id\n"))
+        with pytest.raises(TaskExecutionError, match="unexpected job id"):
+            await _launch(_shared(inner), tmp_path, "a")
 
     async def test_release_cancels_and_the_next_task_resubmits(
         self, inner: FakeInner, tmp_path: Path
@@ -144,9 +206,25 @@ class TestAllocation:
 
         assert inner.commands_starting("scancel") == ["scancel 12345"]
         assert not target.is_live
+        assert not (_alloc_dirs(tmp_path)[0] / "spool").exists()
         await _launch(target, tmp_path, "b")
         assert len(inner.commands_starting("sbatch")) == 2
         assert target.generation == 2
+
+    async def test_releasing_an_allocation_slurm_forgot_succeeds(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """It ended on its own and was purged: nothing left to cancel."""
+        inner.responds(
+            scancel=FakeProcess(
+                stderr=b"scancel: error: Invalid job id specified\n",
+                returncode=1,
+            )
+        )
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        await target.release("done")
+        assert not target.is_live
 
     async def test_an_ended_allocation_is_replaced(
         self, inner: FakeInner, tmp_path: Path
@@ -166,83 +244,149 @@ class TestAllocation:
         calls: list[int] = []
 
         async def ready() -> None:
-            calls.append(len(_spooled(inner)))
+            calls.append(len(_spooled(tmp_path)))
 
         target.on_ready(ready)
         await _launch(target, tmp_path, "a")
         await _launch(target, tmp_path, "b")
         assert calls == [0]
 
-    async def test_cancel_signals_only_the_step(
+    async def test_a_slow_callback_does_not_hold_up_a_release(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """The allocation the other tasks share is left alone."""
+        """The callbacks run outside the lock a release needs."""
+        target = _shared(inner)
+        restoring = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def ready() -> None:
+            restoring.set()
+            await finish.wait()
+
+        target.on_ready(ready)
+        launch = asyncio.create_task(_launch(target, tmp_path, "a"))
+        await restoring.wait()
+        await asyncio.wait_for(target.release("abort"), timeout=1)
+        finish.set()
+        await launch
+
+    async def test_keepalive_touches_the_heartbeat(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """The pilot's proof that the orchestrator is still there."""
+        target = _shared(inner)
+        await _launch(target, tmp_path, "a")
+        heartbeat = _alloc_dirs(tmp_path)[0] / "heartbeat"
+        os.utime(heartbeat, (0, 0))
+        await target.keepalive()
+        assert heartbeat.stat().st_mtime > 0
+
+    async def test_cancel_takes_a_spooled_step_back(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Not started yet: never starts, and is recorded at once."""
+        target = _shared(inner)
+        handle = await _launch(target, tmp_path, "b")
+        await target.send_signal(handle, signal_mod.SIGTERM)
+
+        assert _spooled(tmp_path) == []
+        assert (tmp_path / "b" / "exit_code").read_text().strip() == "143"
+        assert list(_alloc_dirs(tmp_path)[0].glob("run/*.cancel"))
+        # The allocation the other tasks share is left alone.
+        assert inner.commands_starting("scancel") == []
+
+    async def test_other_signals_reach_only_the_step(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """Found by name among the allocation's steps."""
         inner.responds(
             **{
                 "squeue -s": FakeProcess(
                     stdout=b"12345.0|horus-a\n12345.1|horus-b\n"
                 )
             },
-            squeue=RUNNING,
         )
         target = _shared(inner)
         handle = await _launch(target, tmp_path, "b")
-        await target.send_signal(handle, signal_mod.SIGTERM)
-
-        assert inner.commands_starting("scancel") == ["scancel 12345.1"]
-        assert (tmp_path / "b" / "cancel").exists()
+        await target.send_signal(handle, signal_mod.SIGUSR1)
+        assert inner.commands_starting("scancel") == [
+            "scancel --signal=USR1 12345.1"
+        ]
 
 
 @pytest.mark.unit
-class TestLauncher:
-    """The launcher always leaves an exit code behind."""
+class TestScripts:
+    """The launcher and the pilot, run in bash with a fake srun."""
 
-    def _run(self, tmp_path: Path, launcher: str, srun: str) -> str:
+    def _bin(self, tmp_path: Path, srun: str) -> dict[str, str]:
         bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
+        bin_dir.mkdir(exist_ok=True)
         fake = bin_dir / "srun"
         fake.write_text(f"#!/bin/bash\n{srun}\n")
         fake.chmod(0o755)
-        subprocess.run(
-            ["bash", "-c", launcher],
-            check=True,
-            env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
-        )
-        return (tmp_path / "a" / "exit_code").read_text().strip()
+        return {"PATH": f"{bin_dir}:/usr/bin:/bin"}
 
-    async def _launcher(
+    async def _launched(
         self, inner: FakeInner, tmp_path: Path, cmd: str = "exit 3"
-    ) -> str:
-        inner.responds(squeue=RUNNING)
+    ) -> tuple[SlurmTarget, JobHandle, Path]:
         target = _shared(inner)
-        task = _Task(str(tmp_path / "a"), id="a")
-        target.bind(task)  # type: ignore[arg-type]
-        await target.launch(
-            cmd, cwd=task.working_dir, env=None, job_dir=f"{tmp_path}/a"
-        )
-        return _spooled(inner)[0].read_text()
+        handle = await _launch(target, tmp_path, "a", cmd=cmd)
+        return target, handle, _spooled(tmp_path)[0]
+
+    def _exit_code(self, tmp_path: Path) -> str:
+        return (tmp_path / "a" / "exit_code").read_text().strip()
 
     async def test_the_step_writes_its_own_exit_code(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """The step runs the script, whose exit code is kept."""
-        launcher = await self._launcher(inner, tmp_path)
-        assert self._run(tmp_path, launcher, 'exec bash "${@: -1}"') == "3"
+        """Srun runs the script, whose exit code is kept."""
+        _t, _h, launcher = await self._launched(inner, tmp_path)
+        env = self._bin(tmp_path, 'exec bash "${@: -1}"')
+        subprocess.run(["bash", str(launcher)], check=True, env=env)
+        assert self._exit_code(tmp_path) == "3"
 
     async def test_a_failed_srun_still_leaves_an_exit_code(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
         """A step that never ran must not leave poll waiting forever."""
-        launcher = await self._launcher(inner, tmp_path)
-        assert self._run(tmp_path, launcher, "exit 9") == "9"
+        _t, _h, launcher = await self._launched(inner, tmp_path)
+        env = self._bin(tmp_path, "exit 9")
+        subprocess.run(["bash", str(launcher)], check=True, env=env)
+        assert self._exit_code(tmp_path) == "9"
 
-    async def test_a_cancelled_step_never_starts(
+    async def test_a_cancel_stops_a_waiting_or_running_step(
         self, inner: FakeInner, tmp_path: Path
     ) -> None:
-        """Cancelled while spooled: recorded, srun never called."""
-        launcher = await self._launcher(inner, tmp_path)
-        (tmp_path / "a" / "cancel").touch()
-        assert self._run(tmp_path, launcher, "exit 99") == "143"
+        """The launcher watches the mark while srun waits or runs."""
+        target, handle, launcher = await self._launched(inner, tmp_path)
+        env = self._bin(tmp_path, "trap 'exit 143' TERM; sleep 30 & wait")
+        # Claimed, as the pilot would, so the cancel cannot take it back.
+        claimed = launcher.parent.parent / "run" / launcher.name
+        launcher.rename(claimed)
+        proc = subprocess.Popen(["bash", str(claimed)], env=env)
+        await asyncio.sleep(0.5)
+        await target.send_signal(handle, signal_mod.SIGTERM)
+        assert proc.wait(timeout=10) == 0
+        assert self._exit_code(tmp_path) == "143"
+
+    async def test_the_pilot_runs_steps_and_ends_when_orphaned(
+        self, inner: FakeInner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spooled steps run; a stale heartbeat when idle ends it."""
+        monkeypatch.setattr(
+            slurm_mod,
+            "PILOT_LOOP",
+            slurm_mod.PILOT_LOOP.replace("-gt 900", "-gt 1"),
+        )
+        target, _h, launcher = await self._launched(inner, tmp_path, "true")
+        alloc = launcher.parent.parent
+        pilot = target._pilot_script(str(alloc))
+        old = time.time() - 60
+        os.utime(alloc / "heartbeat", (old, old))
+        env = self._bin(tmp_path, 'exec bash "${@: -1}"')
+        subprocess.run(["bash", "-c", pilot], check=True, env=env, timeout=20)
+        assert self._exit_code(tmp_path) == "0"
+        assert list((alloc / "run").glob("*.sh"))
 
 
 @pytest.mark.unit
@@ -272,3 +416,11 @@ class TestValidation:
         assert "3h walltime" in errors[1]
         fits = _Task(str(tmp_path), ResourceRequest(cpus=8, walltime="1h"))
         assert target.validate_member(fits) == []  # type: ignore[arg-type]
+
+    def test_zero_means_no_limit(
+        self, inner: FakeInner, tmp_path: Path
+    ) -> None:
+        """mem=0 is all of the node's memory to Slurm, not none."""
+        target = _shared(inner, mem="0")
+        task = _Task(str(tmp_path), ResourceRequest(memory_gb=64))
+        assert target.validate_member(task) == []  # type: ignore[arg-type]

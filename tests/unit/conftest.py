@@ -73,11 +73,17 @@ class FakeInner(LocalTarget):
 
     _responses: dict[str, FakeProcess] = PrivateAttr(default_factory=dict)
     _commands: list[str] = PrivateAttr(default_factory=list)
+    _live: tuple[str, ...] = PrivateAttr(default=())
 
     @property
     def commands(self) -> list[str]:
         """Every command this transport was asked to run, in order."""
         return self._commands
+
+    def runs(self, *prefixes: str) -> "FakeInner":
+        """Really run commands with these prefixes (file plumbing)."""
+        self._live += prefixes
+        return self
 
     def responds(self, **responses: FakeProcess) -> "FakeInner":
         """Canned answers, keyed by command prefix. Chainable."""
@@ -92,8 +98,10 @@ class FakeInner(LocalTarget):
         env: dict[str, str] | None = None,
     ) -> ChannelProcess:
         """Record *cmd* and answer from the canned responses."""
-        del cwd, env
         self._commands.append(cmd)
+        if cmd.startswith(self._live):
+            return await super().run_command_sync(cmd, cwd=cwd, env=env)
+        del cwd, env
         for prefix, proc in self._responses.items():
             if cmd.startswith(prefix):
                 return proc
