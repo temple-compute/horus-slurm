@@ -545,8 +545,13 @@ class SlurmTarget(BaseTarget):
         script_path = f"{job_dir}/job.sh"
         extra: dict[str, str] = {}
         if self.releasable:
+            # The step writes its own logs, closed before exit_code: srun's
+            # --output is flushed by slurmstepd after the step, so poll could
+            # see the exit code before the output.
+            q = shlex.quote
+            logged = f"( {cmd} ) >>{q(stdout_path)} 2>>{q(stderr_path)}"
             script = "\n".join(
-                ["#!/bin/bash", *self._script_body(cmd, cwd, env, job_dir)]
+                ["#!/bin/bash", *self._script_body(logged, cwd, env, job_dir)]
             )
             step = f"horus-{Path(job_dir).name}"
             self._alloc.closed = False
@@ -1024,7 +1029,6 @@ class SlurmTarget(BaseTarget):
                 mem = "0"
         # A step gets every GPU of the job unless it says otherwise.
         gres = step_res.gres or ("none" if self.gres else None)
-        stdout_path, stderr_path = self._log_paths(job_dir)
         q = shlex.quote
         run = f"{alloc_dir}/run/{step}"
         exit_path = q(f"{job_dir}/exit_code")
@@ -1035,8 +1039,6 @@ class SlurmTarget(BaseTarget):
             f"--cpus-per-task={step_res.cpus_per_task}",
             f"--mem={q(mem)}",
             *([f"--gres={q(gres)}"] if gres else []),
-            f"--output={q(stdout_path)}",
-            f"--error={q(stderr_path)}",
             f"bash {q(run + '.job')}",
         ]
         launcher = (
