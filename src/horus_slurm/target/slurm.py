@@ -26,7 +26,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Self
 
 from horus_builtin.target.local import LocalTarget
 from horus_runtime.context import HorusContext
@@ -458,6 +458,18 @@ class SlurmTarget(BaseTarget):
         # Delegate so this stays correct if the transport itself remaps
         # paths (e.g. SSHTarget copies artifacts to an on-host location).
         return self.inner.path_on_target(artifact)
+
+    def idle_copy(self) -> Self:
+        """
+        An idle copy with its own transport, still in the same allocation.
+
+        A shallow copy would share ``inner``: every map clone would run over
+        one SSH connection and together overrun sshd's ``MaxSessions``. The
+        transport's own ``idle_copy`` gives each copy its own connection.
+        """
+        copy = super().idle_copy()
+        copy.inner = self.inner.idle_copy()
+        return copy
 
     # --- control-plane passthrough ------------------------------------------
 

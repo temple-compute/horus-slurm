@@ -1488,3 +1488,15 @@ class TestOutputAndDelegation:
         await _target(inner).run_command_sync("hostname")
 
         assert "hostname" in inner.commands
+
+    def test_idle_copy_has_its_own_transport(self, inner: FakeInner) -> None:
+        """
+        Map clones each get their own transport (an SSHTarget's own
+        connection) and still share the allocation.
+        """
+        target = _target(inner)
+        copy = target.idle_copy()
+
+        assert copy.inner is not inner
+        assert isinstance(copy.inner, FakeInner)
+        assert copy._alloc is target._alloc
