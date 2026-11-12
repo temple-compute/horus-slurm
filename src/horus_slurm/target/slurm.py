@@ -20,6 +20,7 @@ Slurm target for horus-runtime.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 import signal
@@ -38,7 +39,7 @@ from horus_runtime.core.target.channel import (
 )
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from horus_slurm.events import (
     CANCELLING,
@@ -414,6 +415,20 @@ class SlurmTarget(BaseTarget):
                 % {"field": info.field_name}
             )
         return value
+
+    @model_validator(mode="after")
+    def _inner_allowed(self) -> Self:
+        """
+        Refuse a local transport where ``HORUS_SLURM_ALLOW_LOCAL_INNER`` is
+        off: hosts that run workflows written by others set it to ``false``.
+        """
+        allowed = os.environ.get("HORUS_SLURM_ALLOW_LOCAL_INNER", "true")
+        off = allowed.strip().lower() in ("0", "false", "no", "off")
+        if off and isinstance(self.inner, LocalTarget):
+            raise ValueError(
+                _("A local inner target is disabled on this host.")
+            )
+        return self
 
     @field_validator("extra_sbatch_args")
     @classmethod
