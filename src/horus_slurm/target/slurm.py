@@ -26,7 +26,15 @@ import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Self
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    NamedTuple,
+    Protocol,
+    Self,
+    runtime_checkable,
+)
 
 from horus_builtin.target.local import LocalTarget
 from horus_runtime.context import HorusContext
@@ -174,6 +182,26 @@ _JOB_ID = re.compile(r"\d+(_\d+)?")
 # none of these; extra_sbatch_args may hold anything but a new line.
 _STRICT_BAD = re.compile(r"[\s#'\"\\\x00]")
 _LINE_BAD = re.compile(r"[\n\r\x00]")
+
+
+@runtime_checkable
+class SlurmOps(Protocol):
+    """
+    A transport that runs Slurm itself, as a horus-agent does: it renders
+    the batch script from its own approved copy of the task, so no Slurm
+    command line is sent to it.
+    """
+
+    async def slurm_submit(
+        self, *, cwd: str | None, env: dict[str, str] | None, job_dir: str
+    ) -> str:
+        """Submit the running task from *job_dir*; its job id."""
+
+    async def slurm_status(self, job_dir: str) -> dict[str, Any]:
+        """``{state, reason, nodes, exit_code, final}`` of the job."""
+
+    async def slurm_cancel(self, job_dir: str) -> None:
+        """Cancel the job submitted from *job_dir*."""
 
 
 @dataclass(eq=False)
@@ -471,6 +499,22 @@ class SlurmTarget(BaseTarget):
         copy.inner = self.inner.idle_copy()
         return copy
 
+    @property
+    def slurm_ops(self) -> SlurmOps | None:
+        """
+        The transport's own Slurm ops when it is an agent that runs approved
+        releases only; ``None`` to run Slurm commands over its shell.
+        """
+        inner = self.inner
+        if isinstance(inner, SlurmOps) and getattr(inner, "strict", False):
+            return inner
+        return None
+
+    def bind(self, task: BaseTask) -> None:
+        """Bind the transport too, so its own refusals apply under Slurm."""
+        self.inner.bind(task)
+        super().bind(task)
+
     # --- control-plane passthrough ------------------------------------------
 
     async def run_command_sync(
@@ -536,6 +580,39 @@ class SlurmTarget(BaseTarget):
         """
         await self.inner.remove(path)
 
+    # File hooks: runtimes that have them (path_digest...) call them on this
+    # target; the transport's own (native on an agent) does the work. Older
+    # runtimes have none and never call these.
+
+    def _file_hook(self, name: str) -> Callable[..., Awaitable[Any]]:
+        """The transport's *name* hook, else this target's inherited one."""
+        hook = getattr(self.inner, name, None)
+        if hook is None:
+            hook = getattr(super(), name)
+        return hook  # type: ignore[no-any-return]
+
+    async def path_digest(self, path: str, mode: str = "deep") -> str | None:
+        """Delegate to inner."""
+        digest: str | None = await self._file_hook("path_digest")(path, mode)
+        return digest
+
+    async def pack_folder(self, src: str, pkg: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("pack_folder")(src, pkg)
+
+    async def unpack_folder(self, pkg: str, dest: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("unpack_folder")(pkg, dest)
+
+    async def move_file(self, src: str, dst: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("move_file")(src, dst)
+
+    async def file_size(self, path: str) -> int:
+        """Delegate to inner."""
+        size: int = await self._file_hook("file_size")(path)
+        return size
+
     async def launch(
         self,
         cmd: str,
@@ -556,7 +633,20 @@ class SlurmTarget(BaseTarget):
 
         script_path = f"{job_dir}/job.sh"
         extra: dict[str, str] = {}
-        if self.releasable:
+        ops = self.slurm_ops
+        if ops is not None:
+            if self.releasable:
+                raise TaskExecutionError(
+                    _("A shared Slurm target cannot run through this agent.")
+                )
+            # The agent writes and submits the script; cmd is not sent.
+            job_id = raw_id = await ops.slurm_submit(
+                cwd=cwd, env=env, job_dir=job_dir
+            )
+            script = (await self._read_log(script_path)).decode(
+                errors="replace"
+            )
+        elif self.releasable:
             # The step writes its own logs, closed before exit_code: srun's
             # --output is flushed by slurmstepd after the step, so poll could
             # see the exit code before the output.
@@ -1286,6 +1376,9 @@ class SlurmTarget(BaseTarget):
         Report the Slurm job, not whatever the orchestrator spawned.
         """
         del process
+        if self.slurm_ops is not None:
+            # Its probe reads sacct over the shell, which the agent refuses.
+            return None
         return SlurmJobScope(job_id_file=self._job_id_path(task))
 
     @staticmethod
@@ -1522,6 +1615,9 @@ class SlurmTarget(BaseTarget):
         ranged read (``tail -c +offset``) if job logs get large enough to
         matter.
         """
+        if self.slurm_ops is not None:
+            # The agent's own reader, which follows its logs policy.
+            return await self.inner.read_output(handle)
         stdout_path, stderr_path = self._log_paths(handle.job_dir)
         return await self._read_log(stdout_path), await self._read_log(
             stderr_path
@@ -1532,6 +1628,20 @@ class SlurmTarget(BaseTarget):
         Send signal to the job.
         """
         job_id = self._handle_job_id(handle)
+        ops = self.slurm_ops
+        if ops is not None:
+            # The agent can only cancel; other signals have no op.
+            if sig in (signal.SIGKILL, signal.SIGTERM):
+                try:
+                    await ops.slurm_cancel(handle.job_dir)
+                except TaskExecutionError as exc:
+                    horus_logger.log.debug(
+                        _("Could not cancel Slurm job %(job_id)s: %(err)s")
+                        % {"job_id": job_id, "err": exc}
+                    )
+                self._cancelling = True
+                await self._announce(job_id, CANCELLING)
+            return
         step = (handle.extra or {}).get("step")
         if step is not None:
             await self._signal_step(handle, job_id, step, sig)
@@ -1634,7 +1744,8 @@ class SlurmTarget(BaseTarget):
         files are collected next to the job record; an unbound target keeps
         them in *job_dir*.
         """
-        if self._task is None:
+        # The agent's script logs to job_dir too.
+        if self._task is None or self.slurm_ops is not None:
             return f"{job_dir}/stdout.log", f"{job_dir}/stderr.log"
         side = self._task.side_artifacts_dir
         return f"{side}/{STDOUT_FILE}", f"{side}/{STDERR_FILE}"
@@ -1814,6 +1925,17 @@ class SlurmTarget(BaseTarget):
         hiccup) must NOT be read that way, or a transient scheduler blip will
         fail jobs that are still fine.
         """
+        ops = self.slurm_ops
+        if ops is not None:
+            status = await ops.slurm_status(handle.job_dir)
+            # Out of squeue: accounting's state, so a job still running
+            # (squeue failed) is not taken for gone.
+            final = status.get("final") or {}
+            return QueueState(
+                status.get("state") or final.get("state") or "",
+                status.get("reason"),
+                status.get("nodes"),
+            )
         proc = await self.inner.run_command_sync(
             f'squeue -h -j {self._handle_job_id(handle)} -o "%T|%R|%P"'
         )
@@ -1884,7 +2006,7 @@ class SlurmTarget(BaseTarget):
         state flags (``*`` not responding, ``~`` powered down, ...) stripped.
         Best effort: any failure is ``None``, never a failed job.
         """
-        if not partition:
+        if not partition or self.slurm_ops is not None:
             return None
         try:
             proc = await self.inner.run_command_sync(
@@ -1919,17 +2041,26 @@ class SlurmTarget(BaseTarget):
         or nothing recorded yet. ``sacct`` appends who cancelled a job
         (``CANCELLED by 1000``), so only the first word is the state.
         """
-        proc = await self.inner.run_command_sync(
-            f"sacct -n -X -P -j {self._handle_job_id(handle)} "
-            "-o State,ExitCode,Reason"
-        )
-        out, _err = await proc.communicate()
-        if proc.returncode != 0:
-            return None
-        lines = out.decode(errors="replace").strip().splitlines()
-        if not lines:
-            return None
-        state, code, reason = [*lines[0].split("|"), "", ""][:3]
+        ops = self.slurm_ops
+        if ops is not None:
+            final = (await ops.slurm_status(handle.job_dir)).get("final")
+            if not final:
+                return None
+            state = str(final.get("state") or "")
+            code = str(final.get("exit_code") or "")
+            reason = str(final.get("reason") or "")
+        else:
+            proc = await self.inner.run_command_sync(
+                f"sacct -n -X -P -j {self._handle_job_id(handle)} "
+                "-o State,ExitCode,Reason"
+            )
+            out, _err = await proc.communicate()
+            if proc.returncode != 0:
+                return None
+            lines = out.decode(errors="replace").strip().splitlines()
+            if not lines:
+                return None
+            state, code, reason = [*lines[0].split("|"), "", ""][:3]
         words = state.split()
         if not words:
             return None
