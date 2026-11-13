@@ -11,6 +11,11 @@ Slurm target for the Horus Runtime.
 
 WIP
 
+`SlurmTarget.inner` is the target that reaches the login node: `LocalTarget()` by
+default (the orchestrator runs on the login node), or an `SSHTarget`. On a host that
+runs workflows written by others, set `HORUS_SLURM_ALLOW_LOCAL_INNER=false`: a local
+`inner`, set or defaulted, is then refused.
+
 ---
 
 ## Development
