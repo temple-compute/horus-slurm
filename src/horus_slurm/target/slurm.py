@@ -510,6 +510,11 @@ class SlurmTarget(BaseTarget):
             return inner
         return None
 
+    def bind(self, task: BaseTask) -> None:
+        """Bind the transport too, so its own refusals apply under Slurm."""
+        self.inner.bind(task)
+        super().bind(task)
+
     # --- control-plane passthrough ------------------------------------------
 
     async def run_command_sync(
@@ -574,6 +579,39 @@ class SlurmTarget(BaseTarget):
         Delegate to inner.
         """
         await self.inner.remove(path)
+
+    # File hooks: runtimes that have them (path_digest...) call them on this
+    # target; the transport's own (native on an agent) does the work. Older
+    # runtimes have none and never call these.
+
+    def _file_hook(self, name: str) -> Callable[..., Awaitable[Any]]:
+        """The transport's *name* hook, else this target's inherited one."""
+        hook = getattr(self.inner, name, None)
+        if hook is None:
+            hook = getattr(super(), name)
+        return hook  # type: ignore[no-any-return]
+
+    async def path_digest(self, path: str, mode: str = "deep") -> str | None:
+        """Delegate to inner."""
+        digest: str | None = await self._file_hook("path_digest")(path, mode)
+        return digest
+
+    async def pack_folder(self, src: str, pkg: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("pack_folder")(src, pkg)
+
+    async def unpack_folder(self, pkg: str, dest: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("unpack_folder")(pkg, dest)
+
+    async def move_file(self, src: str, dst: str) -> None:
+        """Delegate to inner."""
+        await self._file_hook("move_file")(src, dst)
+
+    async def file_size(self, path: str) -> int:
+        """Delegate to inner."""
+        size: int = await self._file_hook("file_size")(path)
+        return size
 
     async def launch(
         self,

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from horus_runtime.core.target.base import BaseTarget
 from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from pydantic import PrivateAttr
@@ -70,6 +71,34 @@ class FakeAgent(FakeInner):
         """The job dir's logs, as the agent's reader returns them."""
         self._calls.append(("read_output", {"job_dir": handle.job_dir}))
         return b"out", b"err"
+
+    async def path_digest(self, path: str, mode: str = "deep") -> str:
+        """Record the native digest."""
+        self._calls.append(("digest", {"path": path, "mode": mode}))
+        return "abc"
+
+    async def pack_folder(self, src: str, pkg: str) -> None:
+        """Record the native pack."""
+        self._calls.append(("pack", {"src": src, "pkg": pkg}))
+
+    async def unpack_folder(self, pkg: str, dest: str) -> None:
+        """Record the native unpack."""
+        self._calls.append(("unpack", {"pkg": pkg, "dest": dest}))
+
+    async def move_file(self, src: str, dst: str) -> None:
+        """Record the native move."""
+        self._calls.append(("move", {"src": src, "dst": dst}))
+
+    async def file_size(self, path: str) -> int:
+        """Record the native stat."""
+        self._calls.append(("size", {"path": path}))
+        return 42
+
+    def bind(self, task: Any) -> None:
+        """Refuse a task, as an agent refuses some executors."""
+        if getattr(task, "id", "") == "refused":
+            raise TaskExecutionError("refused")
+        super().bind(task)
 
     def called(self, name: str) -> list[dict[str, Any]]:
         """The arguments of every call to op *name*."""
@@ -287,3 +316,71 @@ class TestAgentSignalsAndOutput:
 
         assert await target.read_output(handle) == (b"out", b"err")
         assert agent.called("read_output") == [{"job_dir": handle.job_dir}]
+
+
+@pytest.mark.unit
+class TestTransportBinding:
+    """The transport sees the task, so its own refusals apply."""
+
+    def test_bind_binds_the_transport(
+        self, agent: FakeAgent, tmp_path: Path
+    ) -> None:
+        """The transport holds the same task as the Slurm target."""
+        target = _target(agent)
+        task = _Task(str(tmp_path))
+        _bind(target, task)
+
+        assert target.inner._task is task  # type: ignore[comparison-overlap]
+
+    def test_a_transport_refusal_stops_the_bind(
+        self, agent: FakeAgent, tmp_path: Path
+    ) -> None:
+        """A task the transport refuses is not bound to the Slurm target."""
+        target = _target(agent)
+
+        with pytest.raises(TaskExecutionError):
+            _bind(target, _Task(str(tmp_path), id="refused"))
+        assert target._task is None
+
+
+@pytest.mark.unit
+class TestFileHooks:
+    """File hooks run on the transport, natively when it has them."""
+
+    async def test_hooks_go_to_the_transport(self, agent: FakeAgent) -> None:
+        """Each hook is the transport's own, never a shell command."""
+        target = _target(agent)
+
+        assert await target.path_digest("/w/a", "fast") == "abc"
+        await target.pack_folder("/w/d", "/w/d.pkg")
+        await target.unpack_folder("/w/d.pkg", "/w/e")
+        await target.move_file("/w/a", "/w/b")
+        assert await target.file_size("/w/a") == 42
+
+        assert agent._calls == [
+            ("digest", {"path": "/w/a", "mode": "fast"}),
+            ("pack", {"src": "/w/d", "pkg": "/w/d.pkg"}),
+            ("unpack", {"pkg": "/w/d.pkg", "dest": "/w/e"}),
+            ("move", {"src": "/w/a", "dst": "/w/b"}),
+            ("size", {"path": "/w/a"}),
+        ]
+        assert agent.commands == []
+
+    async def test_a_transport_without_hooks_uses_the_inherited_one(
+        self, inner: FakeInner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the transport's hook, the runtime's default runs."""
+
+        async def default(self: BaseTarget, path: str) -> int:
+            del self, path
+            return 7
+
+        monkeypatch.setattr(BaseTarget, "file_size", default, raising=False)
+        # A transport with no hook of its own.
+        monkeypatch.setattr(
+            FakeInner, "file_size", property(lambda _: None), raising=False
+        )
+
+        target = SlurmTarget(inner=inner, working_directory="/w")
+
+        assert await target.file_size("/w/a") == 7
