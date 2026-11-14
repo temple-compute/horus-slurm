@@ -313,6 +313,16 @@ class TestHeaderInjection:
         with pytest.raises(ValidationError, match="extra_sbatch_args"):
             _target(inner, extra_sbatch_args=[value])
 
+    def test_local_inner_refused_when_disabled(
+        self, inner: FakeInner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A local transport, set or defaulted, is refused when disabled."""
+        monkeypatch.setenv("HORUS_SLURM_ALLOW_LOCAL_INNER", "false")
+        with pytest.raises(ValidationError, match="local inner"):
+            _target(inner)
+        with pytest.raises(ValidationError, match="local inner"):
+            SlurmTarget()
+
     def test_valid_values_round_trip(self, inner: FakeInner) -> None:
         """What tc-os stores loads back unchanged."""
         target = _target(
