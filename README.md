@@ -16,6 +16,10 @@ default (the orchestrator runs on the login node), or an `SSHTarget`. On a host 
 runs workflows written by others, set `HORUS_SLURM_ALLOW_LOCAL_INNER=false`: a local
 `inner`, set or defaulted, is then refused.
 
+A job Slurm stops at its time limit, out of memory or by preemption fails with that
+reason instead of exit code 1, so a map's `drop_exit_codes` no longer drops it. A
+node failure fails the task as a lost target, which is re-run on a new machine.
+
 ---
 
 ## Development

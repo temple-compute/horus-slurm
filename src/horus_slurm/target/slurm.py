@@ -26,6 +26,7 @@ import shlex
 import signal
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -45,7 +46,10 @@ from horus_runtime.core.target.channel import (
     JobHandle,
     RemoteDirEntry,
 )
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.task.exceptions import (
+    TargetLostError,
+    TaskExecutionError,
+)
 from horus_runtime.logging import horus_logger
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
@@ -69,6 +73,7 @@ from horus_slurm.resources import (
     resolve_resources,
     slurm_mem_mb,
     slurm_seconds,
+    to_slurm_time,
 )
 
 if TYPE_CHECKING:
@@ -114,6 +119,28 @@ ENDED_STATES = frozenset(
 """
 States ``squeue`` may still list an ended job in until ``MinJobAge`` passes.
 """
+
+_STEPD_MARKERS = (
+    ("due to time limit", "TIMEOUT"),
+    ("due to node failure", "NODE_FAIL"),
+    ("due to preemption", "PREEMPTED"),
+    ("oom-kill", "OUT_OF_MEMORY"),
+    ("oom_kill", "OUT_OF_MEMORY"),
+    ("out of memory", "OUT_OF_MEMORY"),
+    ("out-of-memory", "OUT_OF_MEMORY"),
+    ("exceeded job memory limit", "OUT_OF_MEMORY"),
+    ("exceeded step memory limit", "OUT_OF_MEMORY"),
+)
+"""Lowercase slurmstepd stderr markers and the end state each one means."""
+
+_STEPD_TAIL = 65536
+"""
+Bytes of stderr searched for slurmstepd's line: after it, the command still
+has ``KillWait`` to print its own tracebacks.
+"""
+
+_TIME_ARG = re.compile(r"(?:^|\s)(?:--time(?:=|\s+)|-t\s*)(\S+)")
+"""A ``--time``/``-t`` in an extra sbatch argument; its value."""
 
 PARTITION_SUMMARY_INTERVAL = 60.0
 """Seconds between ``sinfo`` reads while the pending reason is unchanged."""
@@ -416,6 +443,15 @@ class SlurmTarget(BaseTarget):
     _cancel_pending: bool = False
     """Set when the cancel of a moved step failed; the next poll retries it."""
 
+    _last_nodes: str | None = None
+    """The last node list squeue gave, kept after the job ends."""
+
+    _ended: TaskExecutionError | None = None
+    """
+    Why Slurm stopped the job, raised by the poll after the one that saw it
+    end: ``stream()`` reads the last output only after a poll that returns.
+    """
+
     _record: SlurmJobRecord | None = None
     """
     The job's durable record, rewritten on every state transition and exit
@@ -688,6 +724,7 @@ class SlurmTarget(BaseTarget):
         await self._publish_job_id(job_id, cwd=cwd)
 
         target_cwd = cwd or self.resolved_working_directory
+        self._last_nodes = self._ended = None
         self._record = SlurmJobRecord(
             job_id=job_id,
             state=SUBMITTED,
@@ -1405,6 +1442,9 @@ class SlurmTarget(BaseTarget):
         """
         Poll job status.
         """
+        if self._ended is not None:
+            error, self._ended = self._ended, None
+            raise error
         exit_code_path = f"{handle.job_dir}/exit_code"
         job_id = self._handle_job_id(handle)
         if self._cancel_pending:
@@ -1419,6 +1459,8 @@ class SlurmTarget(BaseTarget):
                 self._emit_allocation("ready")
             elif gone:
                 self._emit_allocation("released", reason="gone")
+        if queue is not None and queue.nodes:
+            self._last_nodes = queue.nodes
         if queue is not None and queue.state:
             await self._announce(
                 job_id,
@@ -1455,39 +1497,54 @@ class SlurmTarget(BaseTarget):
         # A shared allocation's job id stays set: the run-end release still
         # cleans it up, and the next launch sees it gone and resubmits.
         if gone:
-            # Left the queue without exit_code visible yet. This can be a race:
-            # Slurm sometimes flushes exit_code a few seconds after the job
-            # disappears from squeue. Retry briefly before concluding it was
-            # killed by the scheduler (OOM, node failure, wall-time) or
-            # cancelled outside Horus.
-            code = await self._retry_exit_code(exit_code_path)
-            if code is None:
-                # sacct usually knows what killed it (TIMEOUT, OUT_OF_MEMORY,
-                # NODE_FAIL, ...); GONE only when accounting cannot say.
-                final_state, reason, code = await self._final_state(
-                    handle
-                ) or (GONE, None, None)
-                await self._announce(job_id, final_state, reason)
-                # The script exits with the command's code, so COMPLETED is a
-                # success whose exit_code the login node cannot see yet (NFS
-                # negative lookup caching). Not for a step: sacct -X
-                # describes its allocation.
-                if final_state != "COMPLETED" or "step" in (
-                    handle.extra or {}
-                ):
-                    horus_logger.log.error(
-                        _(
-                            "The job vanished from queue without writing an "
-                            "exit code (%(state)s)."
-                        )
-                        % {"state": final_state}
-                    )
-                    return 1
-                code = code or 0
-            await self._record_exit_code(code)
-            return code
-
+            return await self._vanished(handle, job_id, exit_code_path)
         return None
+
+    async def _vanished(
+        self, handle: JobHandle, job_id: str, exit_code_path: str
+    ) -> int | None:
+        """
+        The exit code of a job that left the queue; ``None`` when Slurm
+        stopped it, for the next poll to raise (see :attr:`_ended`).
+        """
+        # Left the queue without exit_code visible yet. This can be a race:
+        # Slurm sometimes flushes exit_code a few seconds after the job
+        # disappears from squeue. Retry briefly before concluding it was
+        # killed by the scheduler (OOM, node failure, wall-time) or
+        # cancelled outside Horus.
+        gone_at = datetime.now(UTC)
+        code = await self._retry_exit_code(exit_code_path)
+        if code is None:
+            # sacct usually knows what killed it (TIMEOUT, OUT_OF_MEMORY,
+            # NODE_FAIL, ...), else slurmstepd's line in stderr; GONE
+            # only when neither can say.
+            final_state, reason, code = (
+                await self._final_state(handle)
+                or await self._stderr_state(handle)
+                or (GONE, None, None)
+            )
+            step = "step" in (handle.extra or {})
+            error = self._ended_error(job_id, final_state, gone_at, step)
+            await self._announce(job_id, final_state, reason)
+            if error is not None:
+                self._ended = error
+                return None
+            # The script exits with the command's code, so COMPLETED is a
+            # success whose exit_code the login node cannot see yet (NFS
+            # negative lookup caching). Not for a step: sacct -X
+            # describes its allocation.
+            if final_state != "COMPLETED" or step:
+                horus_logger.log.error(
+                    _(
+                        "The job vanished from queue without writing an "
+                        "exit code (%(state)s)."
+                    )
+                    % {"state": final_state}
+                )
+                return 1
+            code = code or 0
+        await self._record_exit_code(code)
+        return code
 
     async def _requeue_step(self, handle: JobHandle) -> bool:
         """
@@ -2044,6 +2101,121 @@ class SlurmTarget(BaseTarget):
             )
             return None
         return counts
+
+    async def _stderr_state(
+        self, handle: JobHandle
+    ) -> tuple[str, None, None] | None:
+        """
+        The end state slurmstepd wrote into the job's stderr when it killed
+        the job, for a cluster without accounting. ``None`` when the tail
+        names none or cannot be read.
+        """
+        try:
+            if self.slurm_ops is not None:
+                err = (await self.read_output(handle))[1]
+            else:
+                err = await self._read_log(self._log_paths(handle.job_dir)[1])
+        except Exception:
+            return None
+        # Only slurmstepd's own lines: the command may print anything.
+        lines = [
+            line
+            for line in err[-_STEPD_TAIL:]
+            .decode(errors="replace")
+            .lower()
+            .splitlines()
+            if line.lstrip().startswith("slurmstepd")
+        ]
+        for marker, state in _STEPD_MARKERS:
+            if any(marker in line for line in lines):
+                return state, None, None
+        return None
+
+    def _time_limit(self, step: bool) -> str | None:
+        """
+        The ``--time`` the job ran under: the allocation's for a step. An
+        extra sbatch argument comes last in the script, so it wins.
+        """
+        limit = (
+            to_slurm_time(self.time_limit)
+            if step
+            else self.resolved_resources().time_limit
+        )
+        for arg in self.extra_sbatch_args:
+            for value in _TIME_ARG.findall(arg):
+                limit = value
+        # Bare minutes ("30") read as HH:MM:SS, like a resolved limit.
+        seconds = slurm_seconds(limit)
+        return to_slurm_time(f"{seconds}s") if seconds else limit
+
+    def _ended_error(
+        self, job_id: str, state: str, ended_at: datetime, step: bool
+    ) -> TaskExecutionError | None:
+        """
+        The error for a job Slurm stopped at a limit or lost with its node,
+        from what this target already holds. ``None`` for any other end:
+        that fails by exit code, so a map can still drop it.
+        """
+        ids = {"job_id": job_id}
+        if state == "NODE_FAIL":
+            return TargetLostError(
+                _("The node running Slurm job %(job_id)s failed.") % ids
+            )
+        sbatch = self._sbatch_summary()
+        stopped = {
+            "PREEMPTED": _("Slurm job %(job_id)s was preempted."),
+            "OUT_OF_MEMORY": _(
+                "Slurm job %(job_id)s ran out of its %(mem)s memory."
+            )
+            if sbatch["mem"]
+            else _("Slurm job %(job_id)s ran out of memory."),
+        }
+        if state in stopped:
+            return TaskExecutionError(
+                stopped[state] % {**ids, "mem": sbatch["mem"]}
+            )
+        if state != "TIMEOUT":
+            return None
+        limit = self._time_limit(step)
+        states = self._record.states if self._record is not None else []
+        started = next(
+            (s.at for s in reversed(states) if s.state == "RUNNING"), None
+        )
+        node = self._last_nodes
+        # A step's elapsed time says nothing about its allocation's limit.
+        if started is None or not node or step:
+            message = (
+                _("Slurm job %(job_id)s hit its %(limit)s time limit.")
+                if limit
+                else _(
+                    "Slurm job %(job_id)s hit its partition's default time "
+                    "limit."
+                )
+            )
+            return TaskExecutionError(message % {**ids, "limit": limit})
+        seconds = int((ended_at - started).total_seconds())
+        # Seen up to a poll late: never more than the limit itself.
+        seconds = min(seconds, slurm_seconds(limit) or seconds)
+        message = (
+            _(
+                "Slurm job %(job_id)s hit its %(limit)s time limit after "
+                "%(elapsed)s on %(node)s."
+            )
+            if limit
+            else _(
+                "Slurm job %(job_id)s hit its partition's default time limit "
+                "after %(elapsed)s on %(node)s."
+            )
+        )
+        return TaskExecutionError(
+            message
+            % {
+                **ids,
+                "limit": limit,
+                "elapsed": to_slurm_time(f"{seconds}s"),
+                "node": node,
+            }
+        )
 
     async def _final_state(
         self, handle: JobHandle

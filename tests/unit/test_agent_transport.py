@@ -17,7 +17,10 @@ from typing import Any
 import pytest
 from horus_runtime.core.target.base import BaseTarget
 from horus_runtime.core.target.channel import JobHandle
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.task.exceptions import (
+    TargetLostError,
+    TaskExecutionError,
+)
 from pydantic import PrivateAttr
 
 from horus_slurm.target.slurm import JOB_ID_FILE, SlurmTarget
@@ -231,7 +234,7 @@ class TestAgentPolling:
 
     @pytest.mark.parametrize(
         ("state", "code", "expected"),
-        [("COMPLETED", "0:0", 0), ("TIMEOUT", "0:15", 1)],
+        [("COMPLETED", "0:0", 0), ("FAILED", "1:0", 1)],
     )
     async def test_ended_without_exit_code_uses_accounting(
         self,
@@ -250,6 +253,28 @@ class TestAgentPolling:
         assert agent.commands == []
         assert target._record is not None
         assert target._record.state == state
+
+    @pytest.mark.parametrize(
+        ("state", "error"),
+        [("TIMEOUT", TaskExecutionError), ("NODE_FAIL", TargetLostError)],
+    )
+    async def test_a_job_slurm_stopped_raises(
+        self,
+        agent: FakeAgent,
+        tmp_path: Path,
+        state: str,
+        error: type[TaskExecutionError],
+    ) -> None:
+        """Accounting's end state says why, with no shell command."""
+        target = _target(agent)
+        handle = await _launch(target, tmp_path)
+        agent.status(final={"state": state, "exit_code": "0:0"})
+
+        assert await target.poll(handle) is None
+        with pytest.raises(error) as raised:
+            await target.poll(handle)
+        assert type(raised.value) is error
+        assert agent.commands == []
 
     async def test_no_accounting_is_gone(
         self, agent: FakeAgent, tmp_path: Path

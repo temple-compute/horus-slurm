@@ -12,6 +12,7 @@ resource scope it declares.
 import json
 import signal as signal_mod
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,14 @@ import pytest
 from horus_builtin.target.local import LocalTarget
 from horus_runtime.context import HorusContext
 from horus_runtime.core.resources import ResourceRequest
-from horus_runtime.core.target.channel import JobHandle
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.target.channel import (
+    JobHandle,
+    PollingChannelProcess,
+)
+from horus_runtime.core.task.exceptions import (
+    TargetLostError,
+    TaskExecutionError,
+)
 from horus_runtime.event.base import BaseEvent
 from pydantic import ValidationError
 
@@ -663,7 +670,7 @@ class TestPolling:
             (b"COMPLETED|0:0|None\n", 0),
             (b"COMPLETED||None\n", 0),
             (b"FAILED|2:0|NonZeroExitCode\n", 1),
-            (b"TIMEOUT|0:0|None\n", 1),
+            (b"BOOT_FAIL|0:0|None\n", 1),
         ],
     )
     async def test_vanished_without_a_visible_exit_code_trusts_sacct(
@@ -1082,7 +1089,9 @@ class TestJobEvents:
             pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
         )
 
-        assert await target.poll(handle) == 1
+        assert await target.poll(handle) is None
+        with pytest.raises(TaskExecutionError):
+            await target.poll(handle)
         assert [(e.state, e.reason) for e in emitted] == [("TIMEOUT", None)]
 
     async def test_vanishing_keeps_the_accounted_reason(
@@ -1098,7 +1107,9 @@ class TestJobEvents:
             pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
         )
 
-        assert await target.poll(handle) == 1
+        assert await target.poll(handle) is None
+        with pytest.raises(TargetLostError):
+            await target.poll(handle)
         assert [(e.state, e.reason) for e in emitted] == [
             ("NODE_FAIL", "NodeDown")
         ]
@@ -1118,6 +1129,262 @@ class TestJobEvents:
 
         assert await target.poll(handle) == 1
         assert [(e.state, e.reason) for e in emitted] == [("GONE", None)]
+
+    @pytest.mark.parametrize(
+        ("line", "state"),
+        [
+            (
+                b"slurmstepd: error: *** JOB 12345 ON node01 CANCELLED AT "
+                b"2026-11-19T10:00:00 DUE TO TIME LIMIT ***\n",
+                "TIMEOUT",
+            ),
+            (
+                b"slurmstepd: error: Detected 1 oom-kill event(s) in "
+                b"StepId=12345.batch.\n",
+                "OUT_OF_MEMORY",
+            ),
+            (
+                b"slurmstepd: error: *** JOB 12345 ON node01 CANCELLED AT "
+                b"2026-11-19T10:00:00 DUE TO NODE FAILURE ***\n",
+                "NODE_FAIL",
+            ),
+            (
+                b"slurmstepd: error: *** JOB 12345 ON node01 CANCELLED AT "
+                b"2026-11-19T10:00:00 DUE TO PREEMPTION ***\n",
+                "PREEMPTED",
+            ),
+            (
+                b"slurmstepd-node01: error: Exceeded job memory limit\n",
+                "OUT_OF_MEMORY",
+            ),
+            (
+                b"slurmstepd: error: *** JOB 12345 ON node01 CANCELLED AT "
+                b"2026-11-19T10:00:00 DUE TO TIME LIMIT ***\n"
+                + b"  File 'run.py', line 1, in <module>\n"
+                * 1000,
+                "TIMEOUT",
+            ),
+        ],
+    )
+    async def test_vanishing_without_accounting_reads_slurmstepd(
+        self,
+        tmp_path: Path,
+        emitted: list[SlurmJobEvent],
+        line: bytes,
+        state: str,
+    ) -> None:
+        """No slurmdbd, but slurmstepd said in stderr why it killed it."""
+        (tmp_path / "stderr.log").write_bytes(b"working\n" + line)
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(returncode=1),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) is None
+        with pytest.raises(TaskExecutionError):
+            await target.poll(handle)
+        assert [e.state for e in emitted] == [state]
+
+    async def test_the_command_cannot_fake_a_slurmstepd_kill(
+        self, tmp_path: Path, emitted: list[SlurmJobEvent]
+    ) -> None:
+        """Only slurmstepd's own lines count, not the command's output."""
+        (tmp_path / "stderr.log").write_bytes(
+            b"CUDA error: out of memory\n"
+            b"retry: slurmstepd: error: Detected 1 oom-kill event(s)\n"
+        )
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(returncode=1),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        assert await target.poll(handle) == 1
+        assert [e.state for e in emitted] == ["GONE"]
+
+    @pytest.mark.parametrize(
+        ("sacct", "kwargs", "error", "message"),
+        [
+            (
+                b"TIMEOUT|0:0|None\n",
+                {"time_limit": "2h"},
+                TaskExecutionError,
+                "Slurm job 12345 hit its 02:00:00 time limit after 00:00:00 "
+                "on node01.",
+            ),
+            (
+                b"TIMEOUT|0:0|None\n",
+                {},
+                TaskExecutionError,
+                "Slurm job 12345 hit its partition's default time limit "
+                "after 00:00:00 on node01.",
+            ),
+            (
+                b"OUT_OF_MEMORY|0:125|None\n",
+                {"mem": "8G"},
+                TaskExecutionError,
+                "Slurm job 12345 ran out of its 8G memory.",
+            ),
+            (
+                b"OUT_OF_MEMORY|0:125|None\n",
+                {},
+                TaskExecutionError,
+                "Slurm job 12345 ran out of memory.",
+            ),
+            (
+                b"PREEMPTED|0:0|None\n",
+                {},
+                TaskExecutionError,
+                "Slurm job 12345 was preempted.",
+            ),
+            (
+                b"NODE_FAIL|0:0|NodeDown\n",
+                {},
+                TargetLostError,
+                "The node running Slurm job 12345 failed.",
+            ),
+        ],
+    )
+    async def test_a_job_slurm_stopped_says_why(
+        self,
+        tmp_path: Path,
+        sacct: bytes,
+        kwargs: dict[str, str],
+        error: type[TaskExecutionError],
+        message: str,
+    ) -> None:
+        """
+        Not a bare exit code 1: the limit it hit, how long it ran, where.
+        Not a CommandFailedError either, so a map cannot drop it.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"RUNNING|node01\n"),
+            sacct=FakeProcess(stdout=sacct),
+        )
+        target = _target(
+            inner, exit_code_retries=1, exit_code_delay=0.0, **kwargs
+        )
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        assert await target.poll(handle) is None
+        inner.responds(squeue=FakeProcess(stdout=b""))
+
+        assert await target.poll(handle) is None
+        with pytest.raises(error) as raised:
+            await target.poll(handle)
+        assert str(raised.value) == message
+        assert type(raised.value) is error
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            (
+                {"time_limit": "3h"},
+                "Slurm job 12345 hit its 03:00:00 time limit after 02:00:00 "
+                "on node01.",
+            ),
+            (
+                {"time_limit": "3h", "extra_sbatch_args": ["-t 90"]},
+                "Slurm job 12345 hit its 01:30:00 time limit after 01:30:00 "
+                "on node01.",
+            ),
+        ],
+    )
+    async def test_a_timeout_still_in_squeue_keeps_where_and_how_long(
+        self, tmp_path: Path, kwargs: dict[str, Any], message: str
+    ) -> None:
+        """
+        An ended job still in squeue shows its reason, not its nodes; the
+        node it ran on and its run time still make the message.
+        """
+        task = _Task(str(tmp_path))
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            sbatch=FakeProcess(stdout=b"12345\n"),
+            squeue=FakeProcess(stdout=b"RUNNING|node01|p\n"),
+            sacct=FakeProcess(stdout=b"TIMEOUT|0:0|None\n"),
+        )
+        target = _target(
+            inner, exit_code_retries=1, exit_code_delay=0.0, **kwargs
+        )
+        _bind(target, task)
+        handle = await target.launch(
+            "echo hi", cwd=str(tmp_path), env=None, job_dir=str(tmp_path)
+        )
+        assert await target.poll(handle) is None
+        assert target._record is not None
+        started = datetime.now(UTC) - timedelta(hours=2)
+        target._record.states[-1].at = started
+        inner.responds(squeue=FakeProcess(stdout=b"TIMEOUT|(TimeLimit)|p\n"))
+
+        assert await target.poll(handle) is None
+        with pytest.raises(TaskExecutionError) as raised:
+            await target.poll(handle)
+        assert str(raised.value) == message
+
+    async def test_a_step_timeout_names_its_allocation_limit(
+        self, tmp_path: Path
+    ) -> None:
+        """A step's own run time says nothing about its allocation's limit."""
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"TIMEOUT|0:0|None\n"),
+        )
+        target = _target(
+            inner, exit_code_retries=1, exit_code_delay=0.0, time_limit="2h"
+        )
+        handle = JobHandle(
+            pid=None,
+            job_dir=str(tmp_path),
+            extra={"job_id": "12345", "step": "horus-a", "alloc_dir": "x"},
+        )
+
+        assert await target.poll(handle) is None
+        with pytest.raises(TaskExecutionError) as raised:
+            await target.poll(handle)
+        assert (
+            str(raised.value) == "Slurm job 12345 hit its 02:00:00 time limit."
+        )
+
+    async def test_a_stopped_job_streams_its_last_output_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The job's last lines, slurmstepd's among them, are logged."""
+        last = (
+            b"last words\n"
+            b"slurmstepd: error: *** JOB 12345 ON node01 CANCELLED AT "
+            b"2026-11-19T10:00:00 DUE TO TIME LIMIT ***\n"
+        )
+        (tmp_path / "stderr.log").write_bytes(last)
+        inner = FakeInner(working_directory=str(tmp_path)).responds(
+            squeue=FakeProcess(stdout=b""),
+            sacct=FakeProcess(stdout=b"TIMEOUT|0:0|None\n"),
+        )
+        target = _target(inner, exit_code_retries=1, exit_code_delay=0.0)
+        monkeypatch.setattr(
+            SlurmTarget, "poll_interval", property(lambda _: 0)
+        )
+        handle = JobHandle(
+            pid=None, job_dir=str(tmp_path), extra={"job_id": "12345"}
+        )
+
+        streamed: list[bytes] = []
+        with pytest.raises(TaskExecutionError):
+            async for _name, line in PollingChannelProcess(
+                target, handle
+            ).stream():
+                streamed.append(line)
+        assert b"".join(streamed) == last
 
     async def test_announcing_never_breaks_a_poll(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
