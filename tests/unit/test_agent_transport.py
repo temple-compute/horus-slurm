@@ -231,7 +231,7 @@ class TestAgentPolling:
 
     @pytest.mark.parametrize(
         ("state", "code", "expected"),
-        [("COMPLETED", "0:0", 0), ("TIMEOUT", "0:15", 1)],
+        [("COMPLETED", "0:0", 0), ("FAILED", "1:0", 1)],
     )
     async def test_ended_without_exit_code_uses_accounting(
         self,
