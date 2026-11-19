@@ -9,7 +9,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: horus-slurm VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-10-10 18:39+0200\n"
+"POT-Creation-Date: 2026-11-19 21:54+0100\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -28,63 +28,284 @@ msgstr ""
 msgid "No Slurm job id for task %(task)s; no accounting read"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:117
+#: src/horus_slurm/target/slurm.py:309
 msgid "Submit jobs to a Slurm cluster via sbatch"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:293
+#: src/horus_slurm/target/slurm.py:331
+msgid "CPUs per task"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:334
+msgid "Memory"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:336
+msgid "Memory per node with a unit, e.g. 4G. A bare number is megabytes to Slurm."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:342
+msgid "Time limit"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:343
+msgid "Slurm format, e.g. 02:00:00 or 1-00:00:00"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:355
+msgid "Minutes a shared allocation is kept while idle and tasks are still pending"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:362
+msgid "Tasks that run at once in a shared allocation"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:368
+msgid "Allocation folder retention (days)"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:375
+msgid "Task moves to a new allocation"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:395
+msgid "Poll interval"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:396
+msgid "Seconds between checks of each task's exit file"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:404
+msgid "Queue check interval"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:405
+msgid "Seconds between squeue checks of a shared allocation"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:456
+#, python-format
+msgid "%(field)s may not contain whitespace, '#', quotes or backslashes."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:473
+msgid "A local inner target is disabled on this host."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:484
+msgid "extra_sbatch_args may not contain line breaks."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:671
+msgid "A shared Slurm target cannot run through this agent."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:735
 #, python-format
 msgid "sbatch submission failed: %(error)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:343
+#: src/horus_slurm/target/slurm.py:745
+#, python-format
+msgid "sbatch returned an unexpected job id: %(raw)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:792
+#, python-format
+msgid "Shared Slurm target '%(ref)s' needs %(fields)s."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:797
+#, python-format
+msgid "Shared Slurm target '%(ref)s' must use one node."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:822
+#, python-format
+msgid ""
+"Task '%(task)s' needs %(want)s %(what)s but shared Slurm target '%(ref)s'"
+" has %(have)s."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:860
+#, python-format
+msgid "scancel failed: %(error)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:921
+#, python-format
+msgid "Could not announce the allocation phase: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:940
+#, python-format
+msgid "Could not keep the allocation alive: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:963
+msgid "The allocation was released for this run."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1001
+msgid "A machine-ready callback failed."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1030
+#, python-format
+msgid "Could not create the allocation directory %(dir)s: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1107
+#, python-format
+msgid "Could not clean old allocation dirs in %(dir)s: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1211
+#, python-format
+msgid "Could not hand the task to allocation %(job_id)s."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1240
+#, python-format
+msgid "partition %(partition)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1242
+msgid "the default partition"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1244
+#, python-format
+msgid " (requested --time=%(time)s on %(where)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1250
+#, python-format
+msgid ", whose MaxTime is %(max_time)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1277
+#, python-format
+msgid "Could not read the partition's MaxTime: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1300
 #, python-format
 msgid "Could not record job id for observation: %(err)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:384
+#: src/horus_slurm/target/slurm.py:1342
 #, python-format
 msgid "Slurm job %(job_id)s is %(state)s (%(reason)s)"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:390
+#: src/horus_slurm/target/slurm.py:1348
 #, python-format
 msgid "Slurm job %(job_id)s is %(state)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:408
+#: src/horus_slurm/target/slurm.py:1366
 #, python-format
 msgid "Could not announce Slurm job state: %(err)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:426
+#: src/horus_slurm/target/slurm.py:1384
 #, python-format
 msgid "Could not record Slurm job state: %(err)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:512
+#: src/horus_slurm/target/slurm.py:1499
 #, python-format
 msgid "The job vanished from queue without writing an exit code (%(state)s)."
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:540
+#: src/horus_slurm/target/slurm.py:1542 src/horus_slurm/target/slurm.py:1554
+#, python-format
+msgid "Could not move task step %(step)s: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1600
+#, python-format
+msgid "Could not cancel the moved step: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1624
 #, python-format
 msgid "Retrying exit_code fetch, attempt %(attempt)d/%(attempts)d..."
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:620
+#: src/horus_slurm/target/slurm.py:1673
+#, python-format
+msgid "Could not cancel Slurm job %(job_id)s: %(err)s"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1760
 #, python-format
 msgid ""
 "Ignoring vram_gb=%(vram)s: Slurm has no portable flag for GPU memory. "
 "Express it in gres or extra_sbatch_args."
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:694
+#: src/horus_slurm/target/slurm.py:1829
+#, python-format
+msgid ""
+"Invalid value for %(option)s: %(value)r may not contain whitespace, '#', "
+"quotes or backslashes."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1834
+msgid " Check the working directory and the task id."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1842
+#, python-format
+msgid "Invalid extra sbatch argument %(arg)r: a line break."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:1908
 #, python-format
 msgid "Could not read log %(path)s: %(error)s"
 msgstr ""
 
-#: src/horus_slurm/target/slurm.py:790
+#: src/horus_slurm/target/slurm.py:2061
 #, python-format
 msgid "Could not summarise partition %(partition)s: %(err)s"
 msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2114
+#, python-format
+msgid "The node running Slurm job %(job_id)s failed."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2118
+#, python-format
+msgid "Slurm job %(job_id)s was preempted."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2120
+#, python-format
+msgid "Slurm job %(job_id)s ran out of its %(mem)s memory."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2123
+#, python-format
+msgid "Slurm job %(job_id)s ran out of memory."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2131
+msgid "partition default"
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2141
+#, python-format
+msgid "Slurm job %(job_id)s hit its %(limit)s time limit."
+msgstr ""
+
+#: src/horus_slurm/target/slurm.py:2147
+#, python-format
+msgid ""
+"Slurm job %(job_id)s hit its %(limit)s time limit after %(elapsed)s on "
+"%(node)s."
+msgstr ""
+
